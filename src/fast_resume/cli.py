@@ -6,6 +6,7 @@ import click
 import humanize
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .config import AGENTS, INDEX_DIR
 from .index import TantivyIndex
@@ -195,8 +196,11 @@ def _show_stats() -> None:
             if data_dir.startswith(home):
                 data_dir = "~" + data_dir[len(home) :]
 
+            # `data_dir` can be user-controlled (e.g. Crush reads it from
+            # `~/.local/share/crush/projects.json`); wrap in Text to avoid
+            # markup parsing. `agent_name` is hardcoded but kept consistent.
             agent_table.add_row(
-                f"[{color}]{agent_name}[/{color}]",
+                Text(agent_name, style=color),
                 str(raw_stats.file_count),
                 humanize.naturalsize(raw_stats.total_bytes),
                 str(sessions) if sessions > 0 else "[dim]0[/dim]",
@@ -204,11 +208,11 @@ def _show_stats() -> None:
                 humanize.naturalsize(content_size)
                 if content_size > 0
                 else "[dim]-[/dim]",
-                f"[dim]{data_dir}[/dim]",
+                Text(data_dir, style="dim"),
             )
         else:
             agent_table.add_row(
-                f"[{color}]{agent_name}[/{color}]",
+                Text(agent_name, style=color),
                 "[dim]-[/dim]",
                 "[dim]-[/dim]",
                 "[dim]-[/dim]",
@@ -273,7 +277,9 @@ def _show_stats() -> None:
             display_dir = directory
             if display_dir.startswith(home):
                 display_dir = "~" + display_dir[len(home) :]
-            dir_table.add_row(display_dir, str(sessions), f"{messages:,}")
+            # `display_dir` comes from session metadata on disk — wrap in
+            # Text so Rich doesn't interpret embedded markup.
+            dir_table.add_row(Text(display_dir), str(sessions), f"{messages:,}")
 
         console.print(dir_table)
 
@@ -310,11 +316,13 @@ def _list_sessions(query: str, agent: str | None, directory: str | None) -> None
         if len(directory_display) > 35:
             directory_display = "..." + directory_display[-32:]
 
+        # Wrap untrusted strings in Text() so Rich doesn't interpret embedded
+        # markup. Session title/directory/id originate from JSON on disk.
         table.add_row(
-            f"[{agent_style}]{session.agent}[/{agent_style}]",
-            title,
-            directory_display,
-            session.id,
+            Text(session.agent, style=agent_style),
+            Text(title),
+            Text(directory_display),
+            Text(session.id),
         )
 
     console.print(table)
