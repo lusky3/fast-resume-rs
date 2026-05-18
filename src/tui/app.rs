@@ -20,10 +20,22 @@ use crate::session::Session;
 use crate::search::SessionSearch;
 use crate::tui::{
     TuiResult,
+    filter_bar::{FILTER_AGENTS, draw_filter_bar},
+    icons::IconCache,
     input_widget::draw_search_input,
     preview::{draw_preview, first_match_line},
     results_list::draw_results,
 };
+
+/// Options passed into `run_tui`.
+pub struct TuiOpts<'a> {
+    /// Pre-fill the search box with this query string.
+    pub initial_query: &'a str,
+    /// When `true`, create an `IconCache` using Unicode half-blocks instead of
+    /// attempting Sixel/Kitty auto-detection.  Use this for CI, screenshot
+    /// testing, or terminals that don't support inline graphics.
+    pub no_images: bool,
+}
 
 /// Messages sent from the background indexing thread to the event loop.
 enum IndexMsg {
@@ -39,6 +51,10 @@ pub struct State {
     pub preview_scroll: u16,
     pub is_loading: bool,
     pub exit_with: Option<(Vec<String>, String)>,
+    /// Active agent filter — `None` means "show all agents".
+    pub active_agent_filter: Option<String>,
+    /// Icon cache (loaded lazily per agent).
+    pub icons: IconCache,
     /// Spinner animation frame index.
     spinner_frame: usize,
     /// When the spinner frame was last advanced.
@@ -56,9 +72,20 @@ pub struct State {
 }
 
 impl State {
-    fn new(initial_query: &str, search: Arc<SessionSearch>, index_rx: Receiver<IndexMsg>) -> Self {
+    fn new(
+        initial_query: &str,
+        search: Arc<SessionSearch>,
+        index_rx: Receiver<IndexMsg>,
+        no_images: bool,
+    ) -> Self {
         let mut table_state = ratatui::widgets::TableState::default();
         table_state.select(Some(0));
+
+        let icons = if no_images {
+            IconCache::halfblocks()
+        } else {
+            IconCache::new().unwrap_or_else(|_| IconCache::halfblocks())
+        };
 
         Self {
             input: Input::from(initial_query),
@@ -67,6 +94,8 @@ impl State {
             preview_scroll: 0,
             is_loading: true,
             exit_with: None,
+            active_agent_filter: None,
+            icons,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             last_search_at: Instant::now(),
@@ -75,6 +104,37 @@ impl State {
             search,
             initial_load_done: false,
         }
+    }
+
+    /// Cycle the active agent filter forward through FILTER_AGENTS (plus "all").
+    pub fn cycle_agent_filter_forward(&mut self) {
+        self.active_agent_filter = match self.active_agent_filter.as_deref() {
+            None => Some(FILTER_AGENTS[0].to_string()),
+            Some(current) => {
+                let idx = FILTER_AGENTS.iter().position(|a| *a == current);
+                match idx {
+                    Some(i) if i + 1 < FILTER_AGENTS.len() => {
+                        Some(FILTER_AGENTS[i + 1].to_string())
+                    }
+                    // Last agent → wrap back to "all"
+                    _ => None,
+                }
+            }
+        };
+    }
+
+    /// Cycle the active agent filter backward through FILTER_AGENTS (plus "all").
+    pub fn cycle_agent_filter_backward(&mut self) {
+        self.active_agent_filter = match self.active_agent_filter.as_deref() {
+            None => Some(FILTER_AGENTS[FILTER_AGENTS.len() - 1].to_string()),
+            Some(current) => {
+                let idx = FILTER_AGENTS.iter().position(|a| *a == current);
+                match idx {
+                    Some(0) | None => None,
+                    Some(i) => Some(FILTER_AGENTS[i - 1].to_string()),
+                }
+            }
+        };
     }
 
     /// Process any pending messages from the background thread and handle debounced search.
@@ -219,7 +279,7 @@ impl State {
 }
 
 /// Entry point for the TUI.
-pub fn run_tui(initial_query: &str) -> Result<TuiResult> {
+pub fn run_tui(opts: TuiOpts<'_>) -> Result<TuiResult> {
     let search = Arc::new(SessionSearch::new());
 
     // Spawn background indexing thread.
@@ -237,7 +297,7 @@ pub fn run_tui(initial_query: &str) -> Result<TuiResult> {
     });
 
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, initial_query, search, rx);
+    let result = run_app(&mut terminal, opts.initial_query, opts.no_images, search, rx);
     ratatui::restore();
 
     result
@@ -246,10 +306,11 @@ pub fn run_tui(initial_query: &str) -> Result<TuiResult> {
 fn run_app(
     terminal: &mut DefaultTerminal,
     initial_query: &str,
+    no_images: bool,
     search: Arc<SessionSearch>,
     rx: Receiver<IndexMsg>,
 ) -> Result<TuiResult> {
-    let mut state = State::new(initial_query, search, rx);
+    let mut state = State::new(initial_query, search, rx, no_images);
 
     loop {
         terminal.draw(|f| draw(f, &mut state))?;
@@ -334,8 +395,14 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
             }
         }
 
-        // Tab — reserved for autocomplete (no-op in Phase 3)
-        KeyCode::Tab => {}
+        // Tab — cycle forward through agent filters in the filter bar.
+        KeyCode::Tab => {
+            state.cycle_agent_filter_forward();
+        }
+        // Shift+Tab — cycle backward through agent filters.
+        KeyCode::BackTab => {
+            state.cycle_agent_filter_backward();
+        }
 
         // All other printable keys + Backspace go to the search input via
         // tui-input 0.15's built-in crossterm EventHandler (no version conflict).
@@ -373,6 +440,7 @@ pub fn draw(f: &mut Frame, state: &mut State) {
         .constraints([
             Constraint::Length(1), // title bar
             Constraint::Length(3), // search box (with border)
+            Constraint::Length(1), // filter bar
             Constraint::Min(0),    // main area
             Constraint::Length(1), // footer hints
         ])
@@ -387,15 +455,24 @@ pub fn draw(f: &mut Frame, state: &mut State) {
         chunks[1],
         &state.input,
         state.is_loading,
-        true, // always active in Phase 3
+        true, // always active
         state.spinner_frame,
+    );
+
+    // Filter bar — extract the filter before the mutable borrow of icons.
+    let active_filter = state.active_agent_filter.clone();
+    draw_filter_bar(
+        f,
+        chunks[2],
+        active_filter.as_deref(),
+        &mut state.icons,
     );
 
     // Main area: 60% results, 40% preview
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(chunks[2]);
+        .split(chunks[3]);
 
     // Avoid borrow conflict: extract what we need before mutable borrow of table_state.
     let selected_idx = state.table_state.selected();
@@ -419,7 +496,7 @@ pub fn draw(f: &mut Frame, state: &mut State) {
     );
 
     // Footer
-    draw_footer(f, chunks[3]);
+    draw_footer(f, chunks[4]);
 }
 
 fn draw_title(f: &mut Frame, area: ratatui::layout::Rect, state: &State) {

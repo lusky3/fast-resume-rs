@@ -10,7 +10,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 use search::SessionSearch;
-use tui::run_tui;
+use tui::{app::TuiOpts, run_tui};
 
 /// fast-resume: search and resume AI coding agent sessions.
 #[derive(Parser)]
@@ -19,6 +19,13 @@ struct Cli {
     /// Pre-fill the search box with this query.
     #[arg(value_name = "QUERY")]
     query: Option<String>,
+
+    /// Force Unicode half-block rendering instead of Sixel/Kitty inline images.
+    ///
+    /// Use this flag on terminals that don't support inline graphics, in CI, or
+    /// when capturing screenshots where deterministic output is required.
+    #[arg(long)]
+    no_images: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -35,7 +42,7 @@ fn main() {
 
     match cli.command {
         Some(Commands::Index) => cmd_index(),
-        None => cmd_tui(cli.query.as_deref().unwrap_or("")),
+        None => cmd_tui(cli.query.as_deref().unwrap_or(""), cli.no_images),
     }
 }
 
@@ -77,8 +84,12 @@ fn cmd_index() {
 }
 
 /// Default command — launch the TUI.
-fn cmd_tui(initial_query: &str) {
-    match run_tui(initial_query) {
+fn cmd_tui(initial_query: &str, no_images: bool) {
+    let opts = TuiOpts {
+        initial_query,
+        no_images,
+    };
+    match run_tui(opts) {
         Ok(result) => {
             if let (Some(cmd), Some(_dir)) = (result.resume_command, result.resume_dir) {
                 println!("Launching: {}", cmd.join(" "));
