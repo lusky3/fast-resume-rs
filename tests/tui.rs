@@ -3,10 +3,15 @@
 /// These tests exercise the draw functions in isolation — no event loop, no
 /// terminal. They verify that the widgets render without panicking and that
 /// key content appears in the output buffer.
+///
+/// All tests that involve `IconCache` use `IconCache::halfblocks()` to ensure
+/// deterministic, protocol-agnostic output (no Sixel/Kitty bytes in snapshots).
 use ratatui::{Terminal, backend::TestBackend, layout::Rect, widgets::TableState};
 
 use fr::session::Session;
 use fr::tui::{
+    filter_bar::draw_filter_bar,
+    icons::IconCache,
     preview::draw_preview,
     results_list::draw_results,
 };
@@ -270,6 +275,71 @@ fn test_results_zero_height_no_panic() {
         .draw(|f| {
             let area = Rect::new(0, 0, 80, 3);
             draw_results(f, area, &sessions, &mut state, "");
+        })
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: filter bar renders agent badges
+//
+// Uses `IconCache::halfblocks()` for deterministic, protocol-agnostic output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_filter_bar_renders() {
+    let mut terminal = make_terminal(200, 3);
+    // Use halfblocks to ensure no Sixel/Kitty bytes appear in the snapshot.
+    let mut icons = IconCache::halfblocks();
+
+    terminal
+        .draw(|f| {
+            let area = Rect::new(0, 0, 200, 1);
+            // No active filter — "all" mode.
+            draw_filter_bar(f, area, None, &mut icons);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+    let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+    // The "all" button and at least some agent slugs should appear.
+    assert!(
+        content.contains("all") || content.contains("claude"),
+        "Expected filter bar labels in buffer, got: {:?}",
+        &content[..content.len().min(200)]
+    );
+}
+
+#[test]
+fn test_filter_bar_active_filter() {
+    let mut terminal = make_terminal(200, 3);
+    let mut icons = IconCache::halfblocks();
+
+    // Render with "claude" active.
+    terminal
+        .draw(|f| {
+            let area = Rect::new(0, 0, 200, 1);
+            draw_filter_bar(f, area, Some("claude"), &mut icons);
+        })
+        .unwrap();
+
+    // We just check it doesn't panic and has content — the reversed-style cell
+    // for "claude" won't appear literally differently in a symbol scan.
+    let buf = terminal.backend().buffer().clone();
+    let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(!content.trim().is_empty(), "Filter bar should render something");
+}
+
+#[test]
+fn test_filter_bar_zero_height_no_panic() {
+    let mut terminal = make_terminal(80, 1);
+    let mut icons = IconCache::halfblocks();
+
+    // area height == 0: draw_filter_bar should return early without panic.
+    terminal
+        .draw(|f| {
+            let area = Rect::new(0, 0, 80, 0);
+            draw_filter_bar(f, area, None, &mut icons);
         })
         .unwrap();
 }
