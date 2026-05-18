@@ -3,19 +3,23 @@ mod config;
 mod index;
 mod search;
 mod session;
+mod tui;
 
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
-use adapters::claude::ClaudeAdapter;
-use adapters::AgentAdapter;
 use search::SessionSearch;
+use tui::run_tui;
 
 /// fast-resume: search and resume AI coding agent sessions.
 #[derive(Parser)]
 #[command(name = "fr", version)]
 struct Cli {
+    /// Pre-fill the search box with this query.
+    #[arg(value_name = "QUERY")]
+    query: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -31,7 +35,7 @@ fn main() {
 
     match cli.command {
         Some(Commands::Index) => cmd_index(),
-        None => cmd_list(),
+        None => cmd_tui(cli.query.as_deref().unwrap_or("")),
     }
 }
 
@@ -51,7 +55,6 @@ fn cmd_index() {
 
     let elapsed = started.elapsed();
 
-    // Count per adapter.
     let mut per_adapter: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for s in &sessions {
@@ -73,17 +76,18 @@ fn cmd_index() {
     }
 }
 
-/// Default command (no subcommand) — list Claude sessions as before.
-fn cmd_list() {
-    let adapter = ClaudeAdapter::new();
-    if !adapter.is_available() {
-        eprintln!("~/.claude/projects/ not found — no Claude sessions to list");
-        return;
-    }
-
-    let sessions = adapter.find_sessions();
-    println!("Found {} Claude session(s):", sessions.len());
-    for s in sessions.iter().take(10) {
-        println!("  [{}] {} — {}", s.agent, s.title, s.directory);
+/// Default command — launch the TUI.
+fn cmd_tui(initial_query: &str) {
+    match run_tui(initial_query) {
+        Ok(result) => {
+            if let (Some(cmd), Some(_dir)) = (result.resume_command, result.resume_dir) {
+                println!("Launching: {}", cmd.join(" "));
+                // Phase 7: replace process via execvp. For now, just print.
+            }
+        }
+        Err(e) => {
+            eprintln!("TUI error: {e}");
+            std::process::exit(1);
+        }
     }
 }
