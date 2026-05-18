@@ -74,6 +74,8 @@ pub struct State {
     pub notification: Option<(String, Instant)>,
     /// Terminal size on the last draw — used to map mouse coordinates to widgets.
     pub last_term_size: (u16, u16),
+    /// Agent filter value on the last search run — changing it triggers a re-search.
+    last_agent_filter: Option<String>,
     /// Spinner animation frame index.
     spinner_frame: usize,
     /// When the spinner frame was last advanced.
@@ -125,6 +127,7 @@ impl State {
             suggestion,
             notification: None,
             last_term_size: (0, 0),
+            last_agent_filter: None,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             last_search_at: Instant::now(),
@@ -207,22 +210,33 @@ impl State {
             }
         }
 
-        // Debounced search.
-        if self.initial_load_done
-            && !self.is_loading
-            && self.last_search_at.elapsed() >= Duration::from_millis(50)
-            && self.input.value() != self.current_query
-        {
+        // Debounced search — fires when the query text changes OR when the
+        // agent filter is toggled (the filter change is immediate; no debounce).
+        let filter_changed = self.active_agent_filter != self.last_agent_filter;
+        let query_changed = self.last_search_at.elapsed() >= Duration::from_millis(50)
+            && self.input.value() != self.current_query;
+
+        if self.initial_load_done && !self.is_loading && (filter_changed || query_changed) {
             let query = self.input.value().to_owned();
             let results = if query.is_empty() {
                 self.search.get_all_sessions().unwrap_or_default()
             } else {
                 self.search.search(&query, 100).unwrap_or_default()
             };
+            // Apply agent filter client-side (Tantivy filter will come later; this
+            // is fast enough for typical session counts).
+            let results = if let Some(ref agent) = self.active_agent_filter {
+                results.into_iter().filter(|s| &s.agent == agent).collect()
+            } else {
+                results
+            };
             self.results = results;
             self.current_query = query.clone();
+            self.last_agent_filter = self.active_agent_filter.clone();
             self.clamp_selection();
-            self.reset_preview_scroll_for_query(&query);
+            if query_changed {
+                self.reset_preview_scroll_for_query(&query);
+            }
         }
     }
 
@@ -318,16 +332,15 @@ impl State {
 
         let text = format!("cd {} && {}", session.directory, cmd.join(" "));
 
-        match arboard::Clipboard::new() {
-            Ok(mut cb) => {
-                if cb.set_text(&text).is_ok() {
-                    self.notification = Some(("Copied!".to_owned(), Instant::now()));
-                } else {
-                    self.notification = Some(("Copy failed".to_owned(), Instant::now()));
-                }
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text).map_err(|e| e.into())) {
+            Ok(()) => {
+                self.notification = Some(("Copied!".to_owned(), Instant::now()));
             }
             Err(_) => {
-                self.notification = Some(("Clipboard unavailable".to_owned(), Instant::now()));
+                // Clipboard not available (e.g. WSL2 without X11/Wayland) —
+                // show the command text in the notification bar so the user
+                // can still read and manually copy it.
+                self.notification = Some((format!("Copy: {text}"), Instant::now()));
             }
         }
     }
@@ -549,13 +562,26 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
             state.preview_scroll = state.preview_scroll.saturating_sub(5);
         }
 
-        // Quit
-        KeyCode::Esc | KeyCode::Char('q') => {
-            return true;
+        // Esc: clear the search box if it has text; quit if already empty.
+        KeyCode::Esc => {
+            if state.input.value().is_empty() {
+                return true;
+            }
+            state.input = Input::default();
+            state.suggestion = None;
+            state.last_search_at = Instant::now();
         }
 
-        // Copy resume command to clipboard.
-        KeyCode::Char('c') if key.modifiers != KeyModifiers::CONTROL => {
+        // q and c are single-character shortcuts that only fire when the
+        // search box is empty so they don't hijack ordinary typing.
+        // When the box has text they fall through to the `_` arm below and
+        // type normally.
+        KeyCode::Char('q') if state.input.value().is_empty() => {
+            return true;
+        }
+        KeyCode::Char('c')
+            if key.modifiers != KeyModifiers::CONTROL && state.input.value().is_empty() =>
+        {
             state.copy_resume_command();
         }
 
