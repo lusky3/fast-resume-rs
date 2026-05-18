@@ -13,7 +13,8 @@ use ratatui::{
     text::Span,
     widgets::Paragraph,
 };
-use tui_input::{Input, InputRequest};
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use crate::session::Session;
 use crate::search::SessionSearch;
@@ -336,12 +337,11 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
         // Tab — reserved for autocomplete (no-op in Phase 3)
         KeyCode::Tab => {}
 
-        // All other printable keys + Backspace go to the search input.
+        // All other printable keys + Backspace go to the search input via
+        // tui-input 0.15's built-in crossterm EventHandler (no version conflict).
         _ => {
             let prev_value = state.input.value().to_owned();
-            if let Some(req) = key_to_input_request(&key) {
-                state.input.handle(req);
-            }
+            state.input.handle_event(&Event::Key(key));
             if state.input.value() != prev_value {
                 state.last_search_at = Instant::now();
                 state.is_loading = state.initial_load_done; // show spinner during search
@@ -361,44 +361,6 @@ fn build_resume_command(session: &Session) -> Vec<String> {
         "vibe" => vec!["vibe".to_owned(), "--session".to_owned(), session.id.clone()],
         "kiro" => vec!["kiro".to_owned(), "--session".to_owned(), session.id.clone()],
         _ => vec![session.agent.clone(), "--session".to_owned(), session.id.clone()],
-    }
-}
-
-/// Convert a crossterm `KeyEvent` to a `tui_input::InputRequest`, mirroring the
-/// `tui_input::backend::crossterm::to_input_request` logic without the crossterm version conflict.
-fn key_to_input_request(key: &KeyEvent) -> Option<InputRequest> {
-    use InputRequest::*;
-    match (key.code, key.modifiers) {
-        (KeyCode::Backspace, KeyModifiers::NONE) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-            Some(DeletePrevChar)
-        }
-        (KeyCode::Delete, KeyModifiers::NONE) => Some(DeleteNextChar),
-        (KeyCode::Left, KeyModifiers::NONE) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-            Some(GoToPrevChar)
-        }
-        (KeyCode::Left, KeyModifiers::CONTROL) | (KeyCode::Char('b'), KeyModifiers::META) => {
-            Some(GoToPrevWord)
-        }
-        (KeyCode::Right, KeyModifiers::NONE) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-            Some(GoToNextChar)
-        }
-        (KeyCode::Right, KeyModifiers::CONTROL) | (KeyCode::Char('f'), KeyModifiers::META) => {
-            Some(GoToNextWord)
-        }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(DeleteLine),
-        (KeyCode::Char('w'), KeyModifiers::CONTROL)
-        | (KeyCode::Backspace, KeyModifiers::ALT) => Some(DeletePrevWord),
-        (KeyCode::Delete, KeyModifiers::CONTROL) => Some(DeleteNextWord),
-        (KeyCode::Char('k'), KeyModifiers::CONTROL) => Some(DeleteTillEnd),
-        (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, KeyModifiers::NONE) => {
-            Some(GoToStart)
-        }
-        (KeyCode::Char('e'), KeyModifiers::CONTROL) | (KeyCode::End, KeyModifiers::NONE) => {
-            Some(GoToEnd)
-        }
-        (KeyCode::Char(c), KeyModifiers::NONE) => Some(InsertChar(c)),
-        (KeyCode::Char(c), KeyModifiers::SHIFT) => Some(InsertChar(c)),
-        _ => None,
     }
 }
 

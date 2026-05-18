@@ -28,7 +28,7 @@ rayon = "1"
 parking_lot = "0.12"
 ratatui = "0.30"
 crossterm = "0.29"
-tui-input = "0.15"
+tui-input = { version = "0.15", features = ["ratatui-crossterm"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 
 [profile.release]
