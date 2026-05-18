@@ -5,7 +5,11 @@
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod copilot_vscode;
+pub mod crush;
+pub mod gemini;
 pub mod kiro;
+pub mod opencode;
 pub mod vibe;
 
 use std::collections::HashMap;
