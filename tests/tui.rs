@@ -10,8 +10,10 @@ use ratatui::{Terminal, backend::TestBackend, layout::Rect, widgets::TableState}
 
 use fr::session::Session;
 use fr::tui::{
+    compute_suggestion,
     filter_bar::draw_filter_bar,
     icons::IconCache,
+    modal::{ModalFocus, draw_modal},
     preview::draw_preview,
     results_list::draw_results,
 };
@@ -342,4 +344,130 @@ fn test_filter_bar_zero_height_no_panic() {
             draw_filter_bar(f, area, None, &mut icons);
         })
         .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Test 10 — Modal renders when modal_open is true
+// ---------------------------------------------------------------------------
+
+/// draw_modal renders a centered overlay with the expected content.
+#[test]
+fn test_modal_renders_when_open() {
+    let mut terminal = make_terminal(120, 40);
+
+    terminal
+        .draw(|f| {
+            draw_modal(f, f.area(), false, ModalFocus::Launch);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+    let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+    // The modal title should appear.
+    assert!(
+        content.contains("Launch session"),
+        "Expected 'Launch session' in modal buffer, got: {:?}",
+        &content[..content.len().min(300)]
+    );
+    // The yolo checkbox should appear.
+    assert!(
+        content.contains("[ ]") || content.contains("[x]"),
+        "Expected checkbox in modal buffer"
+    );
+    // The buttons should appear.
+    assert!(
+        content.contains("Launch"),
+        "Expected 'Launch' button in modal buffer"
+    );
+    assert!(
+        content.contains("Cancel"),
+        "Expected 'Cancel' button in modal buffer"
+    );
+}
+
+/// draw_modal renders the yolo checkbox as checked when yolo=true.
+#[test]
+fn test_modal_yolo_checked() {
+    let mut terminal = make_terminal(120, 40);
+
+    terminal
+        .draw(|f| {
+            draw_modal(f, f.area(), true, ModalFocus::Launch);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer().clone();
+    let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+    assert!(
+        content.contains("[x]"),
+        "Expected '[x]' checked checkbox when yolo=true"
+    );
+}
+
+/// draw_modal with Cancel focused — Cancel button shows first.
+#[test]
+fn test_modal_cancel_focus() {
+    let mut terminal = make_terminal(120, 40);
+
+    terminal
+        .draw(|f| {
+            draw_modal(f, f.area(), false, ModalFocus::Cancel);
+        })
+        .unwrap();
+
+    // Should not panic and should show both buttons.
+    let buf = terminal.backend().buffer().clone();
+    let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(content.contains("Cancel"), "Expected 'Cancel' in buffer");
+    assert!(content.contains("Launch"), "Expected 'Launch' in buffer");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Test 11 — Autocomplete suggestion computed correctly
+// ---------------------------------------------------------------------------
+
+/// compute_suggestion returns a completion when query ends with partial agent name.
+#[test]
+fn test_suggestion_appears_for_agent_prefix() {
+    let sug = compute_suggestion("agent:cl");
+    assert_eq!(
+        sug,
+        Some("agent:claude".to_owned()),
+        "Should complete 'cl' to 'claude'"
+    );
+}
+
+#[test]
+fn test_suggestion_codex_prefix() {
+    let sug = compute_suggestion("agent:co");
+    // First match in FILTER_AGENTS starting with "co" is "codex".
+    assert_eq!(sug, Some("agent:codex".to_owned()));
+}
+
+#[test]
+fn test_suggestion_none_for_no_prefix() {
+    let sug = compute_suggestion("some plain text");
+    assert!(sug.is_none(), "No suggestion for plain text");
+}
+
+#[test]
+fn test_suggestion_none_when_complete() {
+    let sug = compute_suggestion("agent:claude");
+    assert!(sug.is_none(), "Complete agent name should not produce suggestion");
+}
+
+#[test]
+fn test_suggestion_none_after_space() {
+    // Once the user adds a space after the agent value, stop suggesting.
+    let sug = compute_suggestion("agent:claude ");
+    assert!(sug.is_none());
+}
+
+#[test]
+fn test_suggestion_with_preceding_text() {
+    // Suggestion should work even when there is text before the agent: keyword.
+    let sug = compute_suggestion("api bug agent:vi");
+    assert_eq!(sug, Some("api bug agent:vibe".to_owned()));
 }

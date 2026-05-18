@@ -10,7 +10,7 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    text::Span,
+    text::{Line, Span},
     widgets::Paragraph,
 };
 use tui_input::Input;
@@ -22,7 +22,7 @@ use crate::tui::{
     TuiResult,
     filter_bar::{FILTER_AGENTS, draw_filter_bar},
     icons::IconCache,
-    input_widget::draw_search_input,
+    modal::{ModalFocus, draw_modal},
     preview::{draw_preview, first_match_line},
     results_list::draw_results,
 };
@@ -32,9 +32,10 @@ pub struct TuiOpts<'a> {
     /// Pre-fill the search box with this query string.
     pub initial_query: &'a str,
     /// When `true`, create an `IconCache` using Unicode half-blocks instead of
-    /// attempting Sixel/Kitty auto-detection.  Use this for CI, screenshot
-    /// testing, or terminals that don't support inline graphics.
+    /// attempting Sixel/Kitty auto-detection.
     pub no_images: bool,
+    /// When `true`, skip the yolo modal and always pass yolo flags.
+    pub yolo: bool,
 }
 
 /// Messages sent from the background indexing thread to the event loop.
@@ -55,6 +56,18 @@ pub struct State {
     pub active_agent_filter: Option<String>,
     /// Icon cache (loaded lazily per agent).
     pub icons: IconCache,
+    /// Whether the yolo modal is open.
+    pub modal_open: bool,
+    /// Current yolo checkbox state in the modal.
+    pub modal_yolo: bool,
+    /// Which button has focus in the modal.
+    pub modal_focus: ModalFocus,
+    /// Global yolo flag (set by --yolo CLI flag).
+    pub global_yolo: bool,
+    /// Autocomplete suggestion for the current input.
+    pub suggestion: Option<String>,
+    /// Brief notification message shown in the title bar.
+    pub notification: Option<(String, Instant)>,
     /// Spinner animation frame index.
     spinner_frame: usize,
     /// When the spinner frame was last advanced.
@@ -77,6 +90,7 @@ impl State {
         search: Arc<SessionSearch>,
         index_rx: Receiver<IndexMsg>,
         no_images: bool,
+        yolo: bool,
     ) -> Self {
         let mut table_state = ratatui::widgets::TableState::default();
         table_state.select(Some(0));
@@ -87,6 +101,8 @@ impl State {
             IconCache::new().unwrap_or_else(|_| IconCache::halfblocks())
         };
 
+        let suggestion = compute_suggestion(initial_query);
+
         Self {
             input: Input::from(initial_query),
             results: Vec::new(),
@@ -96,6 +112,12 @@ impl State {
             exit_with: None,
             active_agent_filter: None,
             icons,
+            modal_open: false,
+            modal_yolo: false,
+            modal_focus: ModalFocus::Launch,
+            global_yolo: yolo,
+            suggestion,
+            notification: None,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             last_search_at: Instant::now(),
@@ -116,7 +138,6 @@ impl State {
                     Some(i) if i + 1 < FILTER_AGENTS.len() => {
                         Some(FILTER_AGENTS[i + 1].to_string())
                     }
-                    // Last agent → wrap back to "all"
                     _ => None,
                 }
             }
@@ -145,18 +166,23 @@ impl State {
             self.last_spinner_tick = Instant::now();
         }
 
-        // Drain the channel — process all pending messages.
+        // Expire notification after 3 seconds.
+        if let Some((_, ts)) = &self.notification {
+            if ts.elapsed() >= Duration::from_secs(3) {
+                self.notification = None;
+            }
+        }
+
+        // Drain the channel.
         while let Ok(msg) = self.index_rx.try_recv() {
             match msg {
                 IndexMsg::Done(sessions) => {
                     self.initial_load_done = true;
                     self.is_loading = false;
-                    // If query is empty show all sessions, else search.
                     let query = self.input.value().to_owned();
                     if query.is_empty() {
                         self.results = sessions;
                     } else {
-                        // Use the already-indexed data — run a search now.
                         match self.search.search(&query, 100) {
                             Ok(hits) => self.results = hits,
                             Err(_) => self.results = sessions,
@@ -174,8 +200,7 @@ impl State {
             }
         }
 
-        // Debounced search: run if 50 ms have elapsed since the last keystroke and the
-        // query has changed.
+        // Debounced search.
         if self.initial_load_done
             && !self.is_loading
             && self.last_search_at.elapsed() >= Duration::from_millis(50)
@@ -183,9 +208,7 @@ impl State {
         {
             let query = self.input.value().to_owned();
             let results = if query.is_empty() {
-                self.search
-                    .get_all_sessions()
-                    .unwrap_or_default()
+                self.search.get_all_sessions().unwrap_or_default()
             } else {
                 self.search.search(&query, 100).unwrap_or_default()
             };
@@ -196,7 +219,6 @@ impl State {
         }
     }
 
-    /// Clamp the selection so it's always within bounds.
     fn clamp_selection(&mut self) {
         if self.results.is_empty() {
             self.table_state.select(None);
@@ -212,7 +234,6 @@ impl State {
     }
 
     fn reset_preview_scroll_for_query(&mut self, query: &str) {
-        // Jump to the first match in the selected session's content.
         let scroll = self
             .selected_session()
             .map(|s| first_match_line(&s.content, query))
@@ -276,13 +297,66 @@ impl State {
         self.table_state.select(Some(prev));
         self.preview_scroll = 0;
     }
+
+    /// Copy the resume command for the selected session to the clipboard.
+    fn copy_resume_command(&mut self) {
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+
+        let adapter = self.search.get_adapter_for_agent(&session.agent);
+        let cmd = adapter
+            .map(|a| a.get_resume_command(&session, self.global_yolo))
+            .unwrap_or_else(|| build_resume_command(&session));
+
+        let text = format!("cd {} && {}", session.directory, cmd.join(" "));
+
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => {
+                if cb.set_text(&text).is_ok() {
+                    self.notification = Some(("Copied!".to_owned(), Instant::now()));
+                } else {
+                    self.notification = Some(("Copy failed".to_owned(), Instant::now()));
+                }
+            }
+            Err(_) => {
+                self.notification = Some(("Clipboard unavailable".to_owned(), Instant::now()));
+            }
+        }
+    }
+}
+
+/// Compute an autocomplete suggestion for the current input value.
+///
+/// When the query ends with `agent:` followed by a partial agent name, find the
+/// first FILTER_AGENTS entry that starts with the partial text and return the
+/// full completion string.
+pub fn compute_suggestion(value: &str) -> Option<String> {
+    // Find the last `agent:` token in the input.
+    let prefix = "agent:";
+    let pos = value.rfind(prefix)?;
+    let after = &value[pos + prefix.len()..];
+
+    // Only suggest when there is no space after the prefix (still typing).
+    if after.contains(' ') {
+        return None;
+    }
+    // Strip any leading `-` or `!` from the partial.
+    let partial = after.trim_start_matches(['-', '!']);
+
+    let completion = FILTER_AGENTS
+        .iter()
+        .find(|&&a| a.starts_with(partial) && a.len() > partial.len())?;
+
+    // Build the full suggestion by replacing the partial with the completion.
+    let suggestion = format!("{}{}", &value[..pos + prefix.len()], completion);
+    Some(suggestion)
 }
 
 /// Entry point for the TUI.
 pub fn run_tui(opts: TuiOpts<'_>) -> Result<TuiResult> {
     let search = Arc::new(SessionSearch::new());
 
-    // Spawn background indexing thread.
     let (tx, rx) = mpsc::channel::<IndexMsg>();
     let search_clone = Arc::clone(&search);
     std::thread::spawn(move || {
@@ -297,7 +371,14 @@ pub fn run_tui(opts: TuiOpts<'_>) -> Result<TuiResult> {
     });
 
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, opts.initial_query, opts.no_images, search, rx);
+    let result = run_app(
+        &mut terminal,
+        opts.initial_query,
+        opts.no_images,
+        opts.yolo,
+        search,
+        rx,
+    );
     ratatui::restore();
 
     result
@@ -307,15 +388,15 @@ fn run_app(
     terminal: &mut DefaultTerminal,
     initial_query: &str,
     no_images: bool,
+    yolo: bool,
     search: Arc<SessionSearch>,
     rx: Receiver<IndexMsg>,
 ) -> Result<TuiResult> {
-    let mut state = State::new(initial_query, search, rx, no_images);
+    let mut state = State::new(initial_query, search, rx, no_images, yolo);
 
     loop {
         terminal.draw(|f| draw(f, &mut state))?;
 
-        // Poll with 50 ms timeout — doubles as debounce tick.
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key)
@@ -356,6 +437,11 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
         return true;
     }
 
+    // ── Modal mode ───────────────────────────────────────────────────────────
+    if state.modal_open {
+        return handle_modal_key(state, key);
+    }
+
     match key.code {
         // Navigation
         KeyCode::Down | KeyCode::Char('j') => {
@@ -384,34 +470,61 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
             return true;
         }
 
+        // Copy resume command to clipboard.
+        KeyCode::Char('c') if key.modifiers != KeyModifiers::CONTROL => {
+            state.copy_resume_command();
+        }
+
         // Resume
         KeyCode::Enter => {
-            if let Some(session) = state.selected_session() {
-                // Build a minimal resume command.
-                let cmd = build_resume_command(session);
-                let dir = session.directory.clone();
-                state.exit_with = Some((cmd, dir));
-                return true;
+            if let Some(session) = state.selected_session().cloned() {
+                let adapter = state.search.get_adapter_for_agent(&session.agent);
+                let needs_modal = adapter
+                    .map(|a| a.supports_yolo())
+                    .unwrap_or(false)
+                    && !state.global_yolo;
+
+                if needs_modal {
+                    state.modal_open = true;
+                    state.modal_focus = ModalFocus::Launch;
+                    state.modal_yolo = false;
+                } else {
+                    let yolo = state.global_yolo;
+                    let cmd = adapter
+                        .map(|a| a.get_resume_command(&session, yolo))
+                        .unwrap_or_else(|| build_resume_command(&session));
+                    let dir = session.directory.clone();
+                    state.exit_with = Some((cmd, dir));
+                    return true;
+                }
             }
         }
 
-        // Tab — cycle forward through agent filters in the filter bar.
+        // Tab — accept autocomplete suggestion OR cycle filter.
         KeyCode::Tab => {
-            state.cycle_agent_filter_forward();
+            if let Some(suggestion) = state.suggestion.clone() {
+                // Accept the suggestion.
+                state.input = Input::from(suggestion.as_str());
+                state.suggestion = None;
+                state.last_search_at = Instant::now();
+            } else {
+                state.cycle_agent_filter_forward();
+            }
         }
         // Shift+Tab — cycle backward through agent filters.
         KeyCode::BackTab => {
             state.cycle_agent_filter_backward();
         }
 
-        // All other printable keys + Backspace go to the search input via
-        // tui-input 0.15's built-in crossterm EventHandler (no version conflict).
+        // All other printable keys + Backspace → search input.
         _ => {
             let prev_value = state.input.value().to_owned();
             state.input.handle_event(&Event::Key(key));
-            if state.input.value() != prev_value {
+            let new_value = state.input.value().to_owned();
+            if new_value != prev_value {
                 state.last_search_at = Instant::now();
-                state.is_loading = state.initial_load_done; // show spinner during search
+                state.is_loading = state.initial_load_done;
+                state.suggestion = compute_suggestion(&new_value);
             }
         }
     }
@@ -419,15 +532,73 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
     false
 }
 
-/// Build a resume command argv list for a session.
+/// Handle a key press when the yolo modal is open.  Returns `true` to quit.
+fn handle_modal_key(state: &mut State, key: KeyEvent) -> bool {
+    match key.code {
+        // Dismiss.
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.modal_open = false;
+        }
+
+        // Toggle yolo.
+        KeyCode::Char(' ') | KeyCode::Char('y') => {
+            state.modal_yolo = true;
+        }
+        KeyCode::Char('n') => {
+            state.modal_yolo = false;
+        }
+
+        // Cycle button focus.
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+            state.modal_focus = state.modal_focus.toggle();
+        }
+
+        // Confirm.
+        KeyCode::Enter => {
+            match state.modal_focus {
+                ModalFocus::Cancel => {
+                    state.modal_open = false;
+                }
+                ModalFocus::Launch => {
+                    if let Some(session) = state.selected_session().cloned() {
+                        let yolo = state.modal_yolo || state.global_yolo;
+                        let adapter = state.search.get_adapter_for_agent(&session.agent);
+                        let cmd = adapter
+                            .map(|a| a.get_resume_command(&session, yolo))
+                            .unwrap_or_else(|| build_resume_command(&session));
+                        let dir = session.directory.clone();
+                        state.modal_open = false;
+                        state.exit_with = Some((cmd, dir));
+                        return true;
+                    }
+                    state.modal_open = false;
+                }
+            }
+        }
+
+        _ => {}
+    }
+    false
+}
+
+/// Fallback resume command when no adapter is found.
 fn build_resume_command(session: &Session) -> Vec<String> {
     match session.agent.as_str() {
         "claude" => vec!["claude".to_owned(), "--resume".to_owned(), session.id.clone()],
         "codex" => vec!["codex".to_owned(), "--session".to_owned(), session.id.clone()],
-        "copilot-cli" => vec!["gh".to_owned(), "copilot".to_owned(), "resume".to_owned(), session.id.clone()],
+        "copilot-cli" => vec![
+            "gh".to_owned(),
+            "copilot".to_owned(),
+            "resume".to_owned(),
+            session.id.clone(),
+        ],
         "vibe" => vec!["vibe".to_owned(), "--session".to_owned(), session.id.clone()],
         "kiro" => vec!["kiro".to_owned(), "--session".to_owned(), session.id.clone()],
-        _ => vec![session.agent.clone(), "--session".to_owned(), session.id.clone()],
+        _ => vec![
+            session.agent.clone(),
+            "--session".to_owned(),
+            session.id.clone(),
+        ],
     }
 }
 
@@ -446,35 +617,25 @@ pub fn draw(f: &mut Frame, state: &mut State) {
         ])
         .split(area);
 
-    // Title bar
     draw_title(f, chunks[0], state);
 
-    // Search input
-    draw_search_input(
+    draw_search_input_with_suggestion(
         f,
         chunks[1],
         &state.input,
         state.is_loading,
-        true, // always active
+        state.suggestion.as_deref(),
         state.spinner_frame,
     );
 
-    // Filter bar — extract the filter before the mutable borrow of icons.
     let active_filter = state.active_agent_filter.clone();
-    draw_filter_bar(
-        f,
-        chunks[2],
-        active_filter.as_deref(),
-        &mut state.icons,
-    );
+    draw_filter_bar(f, chunks[2], active_filter.as_deref(), &mut state.icons);
 
-    // Main area: 60% results, 40% preview
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[3]);
 
-    // Avoid borrow conflict: extract what we need before mutable borrow of table_state.
     let selected_idx = state.table_state.selected();
     let selected_session_clone = selected_idx.and_then(|i| state.results.get(i)).cloned();
     let query = state.current_query.clone();
@@ -495,23 +656,90 @@ pub fn draw(f: &mut Frame, state: &mut State) {
         state.preview_scroll,
     );
 
-    // Footer
-    draw_footer(f, chunks[4]);
+    draw_footer(f, chunks[4], state.modal_open);
+
+    // Modal overlay (drawn last so it's on top).
+    if state.modal_open {
+        draw_modal(f, area, state.modal_yolo, state.modal_focus);
+    }
 }
 
 fn draw_title(f: &mut Frame, area: ratatui::layout::Rect, state: &State) {
     let version = env!("CARGO_PKG_VERSION");
     let count = state.results.len();
-    let text = format!(" fast-resume v{version}   {count} sessions");
+
+    let text = if let Some((msg, _)) = &state.notification {
+        format!(" fast-resume v{version}   {count} sessions   {msg}")
+    } else {
+        format!(" fast-resume v{version}   {count} sessions")
+    };
+
     let para = Paragraph::new(Span::styled(
         text,
-        Style::default().fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(ratatui::style::Modifier::BOLD),
     ));
     f.render_widget(para, area);
 }
 
-fn draw_footer(f: &mut Frame, area: ratatui::layout::Rect) {
-    let hints = " ↑/k prev  ↓/j next  PgUp/PgDn  Enter resume  q quit ";
+fn draw_footer(f: &mut Frame, area: ratatui::layout::Rect, modal_open: bool) {
+    let hints = if modal_open {
+        " Space/y/n: toggle yolo · Tab: switch button · Enter: confirm · Esc: cancel "
+    } else {
+        " ↑/k prev  ↓/j next  PgUp/PgDn  Enter resume  c copy  Tab autocomplete  q quit "
+    };
     let para = Paragraph::new(Span::styled(hints, Style::default().fg(Color::DarkGray)));
     f.render_widget(para, area);
+}
+
+/// Draw the search input with an optional autocomplete suggestion shown as dim text.
+fn draw_search_input_with_suggestion(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    input: &Input,
+    is_loading: bool,
+    suggestion: Option<&str>,
+    spinner_frame: usize,
+) {
+    use crate::tui::input_widget::draw_search_input;
+    use ratatui::layout::Margin;
+    use ratatui::widgets::{Block, Borders};
+
+    // Delegate normal rendering.
+    draw_search_input(f, area, input, is_loading, true, spinner_frame);
+
+    // Overlay the suggestion tail as dim text if present.
+    if let Some(sug) = suggestion {
+        let typed = input.value();
+        if sug.len() > typed.len() && sug.starts_with(typed) {
+            let tail = &sug[typed.len()..];
+            // Compute inner area (same as draw_search_input does).
+            let block = Block::default().borders(Borders::ALL);
+            let inner = area.inner(Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
+            let scroll = input.visual_scroll(inner.width as usize);
+            let cursor_x =
+                inner.x + (input.visual_cursor().saturating_sub(scroll)) as u16;
+
+            if cursor_x < inner.x + inner.width {
+                let sug_area = ratatui::layout::Rect {
+                    x: cursor_x,
+                    y: inner.y,
+                    width: inner.width.saturating_sub(cursor_x - inner.x),
+                    height: 1,
+                };
+                let para = Paragraph::new(Line::from(Span::styled(
+                    tail.to_owned(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                f.render_widget(para, sug_area);
+            }
+
+            // Suppress the unused variable warning.
+            let _ = block;
+        }
+    }
 }
