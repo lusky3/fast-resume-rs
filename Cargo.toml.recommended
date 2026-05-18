@@ -1,0 +1,31 @@
+# Cargo.toml [dependencies] — audited 2026-05-18
+# All versions fetched live from crates.io via `cargo search <crate> --limit 1`
+#
+# tui-input resolution:
+#   tui-input 0.10.1 pinned ratatui = "0.28", conflicting with ratatui 0.30.
+#   tui-input 0.15.3 (latest) resolves cleanly against ratatui 0.30.0 —
+#   UPGRADE to 0.15.3, hand-rolled workaround is no longer needed.
+#   The ratatui-crossterm feature (default) pulls crossterm transitively via
+#   ratatui, so the explicit crossterm = "0.29" dep can remain for direct use.
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }  # unchanged (major "1" → exact pin)
+serde_json = "1.0.149"                                   # unchanged (major "1" → exact pin)
+walkdir = "2.5.0"                                        # unchanged (major "2" → exact pin)
+jiff = "0.2.24"                                          # unchanged (minor "0.2" → exact pin)
+anyhow = "1.0.102"                                       # unchanged (major "1" → exact pin)
+thiserror = "2.0.18"                                     # unchanged (major "2" → exact pin)
+directories = "6.0.0"                                    # CHANGED: 5 → 6.0.0 (new major; BaseDirs API is stable)
+clap = { version = "4.6.1", features = ["derive"] }     # unchanged (4.6 → 4.6.1 patch)
+tantivy = "0.26.1"                                       # unchanged (0.26 → 0.26.1 patch)
+rayon = "1.12.0"                                         # unchanged (major "1" → exact pin)
+parking_lot = "0.12.5"                                   # unchanged (0.12 → 0.12.5 patch)
+ratatui = "0.30.0"                                       # unchanged (0.30 → 0.30.0 exact)
+crossterm = "0.29.0"                                     # unchanged (0.29 → 0.29.0 exact)
+tui-input = "0.15.3"                                     # CHANGED: 0.10 → 0.15.3; now compatible with ratatui 0.30
+
+[dev-dependencies]
+tempfile = "3.27.0"                                      # unchanged (major "3" → exact pin)
+
+# Phase 4 (pending):
+# rusqlite = { version = "0.39.0", features = ["bundled"] }  # plan said 0.36; latest is 0.39.0 — CHANGED
