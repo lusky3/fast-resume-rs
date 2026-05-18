@@ -10,13 +10,18 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use crate::adapters::{AgentAdapter, IncrementalResult};
 use crate::config;
 use crate::index::TantivyIndex;
+use crate::query::{parse_query, Filter};
 use crate::session::Session;
 
 // Import concrete adapters.
 use crate::adapters::claude::ClaudeAdapter;
 use crate::adapters::codex::CodexAdapter;
 use crate::adapters::copilot::CopilotAdapter;
+use crate::adapters::copilot_vscode::CopilotVSCodeAdapter;
+use crate::adapters::crush::CrushAdapter;
+use crate::adapters::gemini::GeminiAdapter;
 use crate::adapters::kiro::KiroAdapter;
+use crate::adapters::opencode::OpenCodeAdapter;
 use crate::adapters::vibe::VibeAdapter;
 
 pub struct SessionSearch {
@@ -31,8 +36,12 @@ impl SessionSearch {
             Box::new(ClaudeAdapter::new()),
             Box::new(CodexAdapter::new()),
             Box::new(CopilotAdapter::new()),
-            Box::new(VibeAdapter::new()),
+            Box::new(CopilotVSCodeAdapter::new()),
+            Box::new(CrushAdapter::new()),
+            Box::new(GeminiAdapter::new()),
             Box::new(KiroAdapter::new()),
+            Box::new(OpenCodeAdapter::new()),
+            Box::new(VibeAdapter::new()),
         ];
         Self {
             adapters,
@@ -90,10 +99,26 @@ impl SessionSearch {
 
     /// Search the index for `query`, look up full sessions by id, and return
     /// the matching sessions in score order.
+    ///
+    /// The query string is parsed for keyword DSL tokens (`agent:`, `dir:`, `date:`)
+    /// before being passed to the Tantivy index.  Any parsed filter is applied as a
+    /// Tantivy filter query; the remaining free-text goes through the hybrid BM25 +
+    /// fuzzy ranker.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Session>> {
         self.index.ensure_index()?;
 
-        let hits = self.index.search(query, limit)?;
+        // Parse the query DSL.
+        let parsed = parse_query(query);
+
+        // Apply agent filter from filter bar if there is no agent: keyword.
+        let hits = self.index.search_with_filters(
+            &parsed.text,
+            parsed.agent.as_ref(),
+            parsed.directory.as_ref(),
+            parsed.date.as_ref(),
+            limit,
+        )?;
+
         if hits.is_empty() {
             return Ok(Vec::new());
         }
@@ -112,6 +137,44 @@ impl SessionSearch {
         Ok(results)
     }
 
+    /// Search with an explicit agent filter (e.g. from the TUI filter bar).
+    pub fn search_with_agent_filter(
+        &self,
+        query: &str,
+        agent_filter: Option<&Filter>,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        self.index.ensure_index()?;
+
+        let parsed = parse_query(query);
+
+        // The caller's agent_filter overrides any agent: keyword in the query
+        // when both are present.
+        let effective_agent = agent_filter.or(parsed.agent.as_ref());
+
+        let hits = self.index.search_with_filters(
+            &parsed.text,
+            effective_agent,
+            parsed.directory.as_ref(),
+            parsed.date.as_ref(),
+            limit,
+        )?;
+
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let all_sessions = self.index.get_all_sessions()?;
+        let by_id: HashMap<String, Session> =
+            all_sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
+
+        let results = hits
+            .into_iter()
+            .filter_map(|(id, _score)| by_id.get(&id).cloned())
+            .collect();
+        Ok(results)
+    }
+
     /// Returns the total number of indexed sessions.
     pub fn get_session_count(&self) -> Result<u64> {
         self.index.ensure_index()?;
@@ -121,6 +184,19 @@ impl SessionSearch {
     /// Returns the number of adapters registered.
     pub fn adapter_count(&self) -> usize {
         self.adapters.len()
+    }
+
+    /// Look up the adapter for a given agent name.
+    pub fn get_adapter_for_agent(&self, agent: &str) -> Option<&dyn AgentAdapter> {
+        self.adapters
+            .iter()
+            .find(|a| a.name() == agent)
+            .map(|a| a.as_ref())
+    }
+
+    /// Return raw stats for all adapters (for `fr --stats`).
+    pub fn get_raw_stats(&self) -> Vec<crate::session::RawAdapterStats> {
+        self.adapters.iter().map(|a| a.get_raw_stats()).collect()
     }
 }
 

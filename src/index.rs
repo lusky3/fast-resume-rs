@@ -2,22 +2,27 @@
 ///
 /// Ported from python/fast_resume/index.py.
 /// Schema version bumped to 22 for the Rust port.
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::ops::Bound;
+
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use tantivy::collector::{DocSetCollector, TopDocs};
-use tantivy::query::QueryParser;
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, QueryParser, RangeQuery,
+    RegexQuery, TermSetQuery,
+};
 use tantivy::schema::{
     Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions, STORED, TEXT,
 };
 use tantivy::schema::Value as TantivyValue;
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 use crate::config::SCHEMA_VERSION;
+use crate::query::{DateFilter, DateOp, Filter};
 use crate::session::Session;
 
 const VERSION_FILE: &str = ".schema_version";
@@ -224,6 +229,59 @@ fn doc_to_session(doc: &TantivyDocument, fields: &SchemaFields) -> Option<Sessio
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Hybrid query builder
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Build a hybrid BM25 + fuzzy query over `title` and `content`.
+///
+/// - Exact BM25 via `QueryParser` (boosted 5×) so precise matches rank first.
+/// - Fuzzy per-term queries (prefix, distance=1) so typos still match.
+fn build_hybrid_query(
+    raw: &str,
+    index: &Index,
+    fields: &SchemaFields,
+) -> Box<dyn tantivy::query::Query> {
+    let mut parser = QueryParser::for_index(index, vec![fields.title, fields.content]);
+    parser.set_conjunction_by_default();
+    let exact: Box<dyn tantivy::query::Query> = parser
+        .parse_query(raw)
+        .unwrap_or_else(|_| Box::new(AllQuery));
+    let boosted_exact: Box<dyn tantivy::query::Query> = Box::new(BoostQuery::new(exact, 5.0));
+
+    const MAX_FUZZY: usize = 8;
+    const MIN_LEN: usize = 2;
+
+    let mut fuzzy_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+    for term_str in raw
+        .split_whitespace()
+        .filter(|t| t.len() >= MIN_LEN)
+        .take(MAX_FUZZY)
+    {
+        let title_term = Term::from_field_text(fields.title, term_str);
+        let content_term = Term::from_field_text(fields.content, term_str);
+        let title_q: Box<dyn tantivy::query::Query> =
+            Box::new(FuzzyTermQuery::new_prefix(title_term, 1, true));
+        let content_q: Box<dyn tantivy::query::Query> =
+            Box::new(FuzzyTermQuery::new_prefix(content_term, 1, true));
+        let or_q: Box<dyn tantivy::query::Query> = Box::new(BooleanQuery::new(vec![
+            (Occur::Should, title_q),
+            (Occur::Should, content_q),
+        ]));
+        fuzzy_clauses.push((Occur::Should, or_q));
+    }
+
+    if fuzzy_clauses.is_empty() {
+        return boosted_exact;
+    }
+
+    let fuzzy_q: Box<dyn tantivy::query::Query> = Box::new(BooleanQuery::new(fuzzy_clauses));
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Should, boosted_exact),
+        (Occur::Should, fuzzy_q),
+    ]))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TantivyIndex public API
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -390,6 +448,161 @@ impl TantivyIndex {
             }
         }
         Ok(results)
+    }
+
+    /// Search with optional agent/directory/date filters and hybrid BM25 + fuzzy ranking.
+    ///
+    /// Any `None` filter is ignored (all docs pass that filter axis).  When
+    /// `query_text` is empty only the filters are applied.  Results are returned
+    /// as `(session_id, score)` sorted by descending score.
+    pub fn search_with_filters(
+        &self,
+        query_text: &str,
+        agent_filter: Option<&Filter>,
+        directory_filter: Option<&Filter>,
+        date_filter: Option<&DateFilter>,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        self.ensure_index()?;
+        let guard = self.inner.lock();
+        let state = guard.as_ref().expect("ensured above");
+
+        let reader = state
+            .index
+            .reader()
+            .context("opening index reader for search_with_filters")?;
+        let searcher = reader.searcher();
+
+        // Build individual filter sub-queries.
+        let mut must_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+        // ── Agent filter ────────────────────────────────────────────────────
+        if let Some(af) = agent_filter {
+            if !af.is_empty() {
+                if !af.include.is_empty() {
+                    let terms: Vec<Term> = af
+                        .include
+                        .iter()
+                        .map(|v| Term::from_field_text(state.fields.agent, v))
+                        .collect();
+                    let q: Box<dyn tantivy::query::Query> = Box::new(TermSetQuery::new(terms));
+                    must_clauses.push((Occur::Must, q));
+                }
+                for excl in &af.exclude {
+                    let term = Term::from_field_text(state.fields.agent, excl);
+                    let q: Box<dyn tantivy::query::Query> =
+                        Box::new(TermSetQuery::new(vec![term]));
+                    must_clauses.push((Occur::MustNot, q));
+                }
+            }
+        }
+
+        // ── Directory filter ────────────────────────────────────────────────
+        if let Some(df) = directory_filter {
+            if !df.is_empty() {
+                for incl in &df.include {
+                    let pattern = format!(
+                        "(?i).*{}.*",
+                        regex::escape(incl)
+                    );
+                    if let Ok(q) =
+                        RegexQuery::from_pattern(&pattern, state.fields.directory)
+                    {
+                        must_clauses.push((Occur::Must, Box::new(q)));
+                    }
+                }
+                for excl in &df.exclude {
+                    let pattern = format!(
+                        "(?i).*{}.*",
+                        regex::escape(excl)
+                    );
+                    if let Ok(q) =
+                        RegexQuery::from_pattern(&pattern, state.fields.directory)
+                    {
+                        must_clauses.push((Occur::MustNot, Box::new(q)));
+                    }
+                }
+            }
+        }
+
+        // ── Date filter ─────────────────────────────────────────────────────
+        if let Some(date_f) = date_filter {
+            let cutoff_f64 = date_f.cutoff.as_second() as f64
+                + (date_f.cutoff.subsec_nanosecond() as f64 / 1_000_000_000.0);
+
+            let range_q: Box<dyn tantivy::query::Query> = match date_f.op {
+                DateOp::Exact | DateOp::LessThan => {
+                    // Sessions with timestamp >= cutoff (newer than cutoff).
+                    Box::new(RangeQuery::new(
+                        Bound::Included(Term::from_field_f64(
+                            state.fields.timestamp,
+                            cutoff_f64,
+                        )),
+                        Bound::Unbounded,
+                    ))
+                }
+                DateOp::GreaterThan => {
+                    // Sessions with timestamp <= cutoff (older than cutoff).
+                    Box::new(RangeQuery::new(
+                        Bound::Unbounded,
+                        Bound::Included(Term::from_field_f64(
+                            state.fields.timestamp,
+                            cutoff_f64,
+                        )),
+                    ))
+                }
+            };
+
+            if date_f.negated {
+                must_clauses.push((Occur::MustNot, range_q));
+            } else {
+                must_clauses.push((Occur::Must, range_q));
+            }
+        }
+
+        // ── Text search (hybrid BM25 + fuzzy) ───────────────────────────────
+        let text_q: Box<dyn tantivy::query::Query> = if query_text.trim().is_empty() {
+            Box::new(AllQuery)
+        } else {
+            build_hybrid_query(query_text, &state.index, &state.fields)
+        };
+
+        // ── Combine everything ───────────────────────────────────────────────
+        let final_query: Box<dyn tantivy::query::Query> = if must_clauses.is_empty() {
+            text_q
+        } else {
+            must_clauses.push((Occur::Must, text_q));
+            Box::new(BooleanQuery::new(must_clauses))
+        };
+
+        let top_docs = searcher
+            .search(
+                final_query.as_ref(),
+                &TopDocs::with_limit(limit).order_by_score(),
+            )
+            .context("executing search_with_filters query")?;
+
+        let mut results = Vec::new();
+        for (score, doc_addr) in top_docs {
+            let doc: TantivyDocument =
+                searcher.doc(doc_addr).context("retrieving search doc")?;
+            if let Some(id) = doc.get_first(state.fields.id).and_then(|v| v.as_str()) {
+                results.push((id.to_string(), score));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Wipe the index directory and force a full rebuild on the next access.
+    pub fn clear(&self) -> Result<()> {
+        let mut guard = self.inner.lock();
+        // Drop the live state so the Mmap is released before we delete.
+        *guard = None;
+        if self.index_path.exists() {
+            std::fs::remove_dir_all(&self.index_path)
+                .context("clearing index directory")?;
+        }
+        Ok(())
     }
 
     /// Returns the total number of documents in the index.
