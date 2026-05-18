@@ -1,10 +1,12 @@
 mod adapters;
 mod config;
 mod index;
+mod query;
 mod search;
 mod session;
 mod tui;
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +29,22 @@ struct Cli {
     #[arg(long)]
     no_images: bool,
 
+    /// Skip the yolo confirmation modal and always pass auto-approve flags.
+    #[arg(long)]
+    yolo: bool,
+
+    /// Print sessions as a table to stdout without launching the TUI.
+    #[arg(long)]
+    no_tui: bool,
+
+    /// Print index statistics (per-agent session counts and adapter info).
+    #[arg(long)]
+    stats: bool,
+
+    /// Wipe the index and force a full re-index on next run.
+    #[arg(long)]
+    rebuild: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -40,9 +58,25 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    if cli.rebuild {
+        cmd_rebuild();
+        return;
+    }
+
+    if cli.stats {
+        cmd_stats();
+        return;
+    }
+
     match cli.command {
         Some(Commands::Index) => cmd_index(),
-        None => cmd_tui(cli.query.as_deref().unwrap_or(""), cli.no_images),
+        None => {
+            if cli.no_tui {
+                cmd_no_tui(cli.query.as_deref().unwrap_or(""));
+            } else {
+                cmd_tui(cli.query.as_deref().unwrap_or(""), cli.no_images, cli.yolo);
+            }
+        }
     }
 }
 
@@ -62,8 +96,7 @@ fn cmd_index() {
 
     let elapsed = started.elapsed();
 
-    let mut per_adapter: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut per_adapter: HashMap<String, usize> = HashMap::new();
     for s in &sessions {
         *per_adapter.entry(s.agent.clone()).or_insert(0) += 1;
     }
@@ -83,22 +116,142 @@ fn cmd_index() {
     }
 }
 
+/// `fr --stats` — print index statistics.
+fn cmd_stats() {
+    let search = SessionSearch::new();
+
+    let sessions = match search.get_all_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error loading sessions: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut per_agent: HashMap<String, usize> = HashMap::new();
+    for s in &sessions {
+        *per_agent.entry(s.agent.clone()).or_insert(0) += 1;
+    }
+
+    println!("Total sessions indexed: {}", sessions.len());
+    println!();
+
+    // Per-adapter raw stats.
+    let raw_stats = search.get_raw_stats();
+    println!("{:<18} {:>8}  {:>12}  {:>8}  Available", "Agent", "Sessions", "Size", "Files");
+    println!("{}", "-".repeat(65));
+    for rs in &raw_stats {
+        let count = per_agent.get(&rs.agent).copied().unwrap_or(0);
+        let size = humanize_bytes(rs.total_bytes);
+        let avail = if rs.available { "yes" } else { "no" };
+        println!(
+            "{:<18} {:>8}  {:>12}  {:>8}  {}",
+            rs.agent, count, size, rs.file_count, avail
+        );
+    }
+}
+
+/// `fr --no-tui [QUERY]` — list sessions as a table.
+fn cmd_no_tui(query: &str) {
+    let search = SessionSearch::new();
+
+    let sessions = if query.is_empty() {
+        match search.get_all_sessions() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error loading sessions: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match search.get_all_sessions().and_then(|_| search.search(query, 100)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error searching sessions: {}", e);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        return;
+    }
+
+    // Print table header.
+    println!(
+        "{:<10}  {:<36}  {:<40}  {:>5}  Directory",
+        "Agent", "ID", "Title", "Msgs"
+    );
+    println!("{}", "-".repeat(140));
+
+    for s in &sessions {
+        let short_id = if s.id.len() > 34 {
+            format!("{}…", &s.id[..34])
+        } else {
+            s.id.clone()
+        };
+        let short_title = if s.title.len() > 38 {
+            format!("{}…", &s.title[..38])
+        } else {
+            s.title.clone()
+        };
+        println!(
+            "{:<10}  {:<36}  {:<40}  {:>5}  {}",
+            s.agent, short_id, short_title, s.message_count, s.directory
+        );
+    }
+}
+
+/// `fr --rebuild` — wipe the index and rebuild from scratch.
+fn cmd_rebuild() {
+    use crate::index::TantivyIndex;
+    use crate::config;
+
+    println!("Wiping index…");
+    let index = TantivyIndex::new(config::index_dir());
+    if let Err(e) = index.clear() {
+        eprintln!("Failed to clear index: {}", e);
+        std::process::exit(1);
+    }
+    println!("Index cleared. Running full re-index…");
+    cmd_index();
+}
+
 /// Default command — launch the TUI.
-fn cmd_tui(initial_query: &str, no_images: bool) {
+fn cmd_tui(initial_query: &str, no_images: bool, yolo: bool) {
     let opts = TuiOpts {
         initial_query,
         no_images,
+        yolo,
     };
     match run_tui(opts) {
         Ok(result) => {
             if let (Some(cmd), Some(_dir)) = (result.resume_command, result.resume_dir) {
                 println!("Launching: {}", cmd.join(" "));
-                // Phase 7: replace process via execvp. For now, just print.
+                // Phase 7: replace process via execvp.
             }
         }
         Err(e) => {
             eprintln!("TUI error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Simple byte size formatter.
+fn humanize_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_024;
+    const MB: u64 = 1_024 * KB;
+    const GB: u64 = 1_024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }

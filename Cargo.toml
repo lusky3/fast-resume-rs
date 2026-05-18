@@ -34,6 +34,8 @@ tui-input = { version = "0.15", features = ["ratatui-crossterm"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "0.25"
+regex = "1"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [profile.release]
 lto = "thin"
