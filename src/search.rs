@@ -1,7 +1,6 @@
 /// SessionSearch: orchestrates incremental adapter scans and Tantivy indexing.
 ///
 /// Ported from python/fast_resume/search.py.
-
 use std::collections::HashMap;
 
 use anyhow::Result;

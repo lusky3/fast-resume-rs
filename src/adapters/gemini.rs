@@ -11,7 +11,6 @@
 ///
 /// Working directories are recovered from `~/.gemini/projects.json`, which maps
 /// directory paths to project slugs.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -395,12 +394,10 @@ fn session_id_quick(session_file: &Path) -> String {
         Ok(file) => {
             if ext == "jsonl" {
                 let reader = BufReader::new(file);
-                let mut count = 0;
-                for line in reader.lines() {
+                for (count, line) in reader.lines().enumerate() {
                     if count >= MAX_HEADER_SCAN_LINES {
                         break;
                     }
-                    count += 1;
                     let line = match line {
                         Ok(l) => l,
                         Err(_) => continue,
@@ -478,8 +475,8 @@ fn f64_to_timestamp(secs: f64) -> jiff::Timestamp {
 }
 
 fn parse_iso_timestamp(s: &str, fallback_mtime: f64) -> jiff::Timestamp {
-    let normalized = if s.ends_with('Z') {
-        format!("{}{}", &s[..s.len() - 1], "+00:00")
+    let normalized = if let Some(without_z) = s.strip_suffix('Z') {
+        format!("{}+00:00", without_z)
     } else {
         s.to_string()
     };

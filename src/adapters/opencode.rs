@@ -10,7 +10,6 @@
 /// - `session` table: id, title, directory, time_created, time_updated (ms)
 /// - `message` table: id, session_id, time_created, data (JSON with `role`)
 /// - `part`    table: message_id, session_id, time_created, data (JSON with `type`, `text`)
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -186,6 +185,7 @@ impl Default for OpenCodeAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_session(
     session_id: &str,
     title: &str,

@@ -2,7 +2,6 @@
 ///
 /// Ported from python/fast_resume/config.py.
 /// SCHEMA_VERSION is bumped to 22 for the Rust port (tokenizer changes may differ).
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 

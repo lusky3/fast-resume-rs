@@ -1,7 +1,6 @@
 /// Adapter trait and helpers for agent session adapters.
 ///
 /// Mirrors python/fast_resume/adapters/base.py.
-
 pub mod claude;
 pub mod codex;
 pub mod copilot;

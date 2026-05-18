@@ -2,7 +2,6 @@
 ///
 /// Faithfully ported from python/fast_resume/adapters/codex.py.
 /// Sessions live under ~/.codex/sessions/ in YYYY/MM/DD/ subdirectories.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -56,7 +55,7 @@ impl CodexAdapter {
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         if let Ok(file) = std::fs::File::open(path) {
             let reader = BufReader::new(file);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 let trimmed = line.trim().to_string();
                 if trimmed.is_empty() {
                     continue;

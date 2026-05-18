@@ -3,7 +3,6 @@
 /// Ported from python/fast_resume/adapters/crush.py.
 /// Sessions live in SQLite databases (`crush.db`) per project.
 /// Projects are enumerated from `~/.local/share/crush/projects.json`.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

@@ -2,7 +2,6 @@
 ///
 /// Faithfully ported from python/fast_resume/adapters/kiro.py.
 /// Sessions live under ~/.kiro/sessions/cli/ as <uuid>.json + <uuid>.jsonl pairs.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -28,8 +27,8 @@ fn f64_to_timestamp(secs: f64) -> jiff::Timestamp {
 
 /// Parse an ISO-8601 / RFC-3339 string to a jiff Timestamp.
 fn parse_iso_timestamp(s: &str, fallback_mtime: f64) -> jiff::Timestamp {
-    let s = if s.ends_with('Z') {
-        format!("{}{}", &s[..s.len() - 1], "+00:00")
+    let s = if let Some(without_z) = s.strip_suffix('Z') {
+        format!("{}+00:00", without_z)
     } else {
         s.to_string()
     };

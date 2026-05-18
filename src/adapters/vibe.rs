@@ -3,7 +3,6 @@
 /// Faithfully ported from python/fast_resume/adapters/vibe.py.
 /// Sessions live under ~/.vibe/logs/session/ as `session_*` directories,
 /// each containing `meta.json` and `messages.jsonl`.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -24,8 +23,8 @@ fn system_time_to_f64(t: std::time::SystemTime) -> f64 {
 /// Parse an ISO-8601 / RFC-3339 string to a jiff Timestamp.
 fn parse_iso_timestamp(s: &str, fallback_mtime: f64) -> jiff::Timestamp {
     // Normalise trailing 'Z' to '+00:00'.
-    let s = if s.ends_with('Z') {
-        format!("{}{}", &s[..s.len() - 1], "+00:00")
+    let s = if let Some(without_z) = s.strip_suffix('Z') {
+        format!("{}+00:00", without_z)
     } else {
         s.to_string()
     };

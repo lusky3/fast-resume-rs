@@ -8,7 +8,6 @@
 ///
 /// The workspace directory is recovered from `workspaceStorage/<hash>/workspace.json`
 /// which holds a `file://` URI to the folder.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;

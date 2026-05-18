@@ -2,7 +2,6 @@
 ///
 /// Faithfully ported from python/fast_resume/adapters/copilot.py.
 /// Sessions live under ~/.copilot/session-state/ as **/*.jsonl.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -81,7 +80,7 @@ impl CopilotAdapter {
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         if let Ok(file) = std::fs::File::open(path) {
             let reader = BufReader::new(file);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 let trimmed = line.trim().to_string();
                 if trimmed.is_empty() {
                     continue;
@@ -201,15 +200,16 @@ impl CopilotAdapter {
             }
 
             // Older Copilot CLI: extract directory from folder_trust info.
-            if msg_type == "session.info" && directory.is_empty() {
-                if data.get("infoType").and_then(|v| v.as_str()) == Some("folder_trust") {
-                    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    // Extract path from "Folder /path/to/dir has been added..."
-                    if let Some(pos) = message.find("Folder /") {
-                        let after = &message[pos + 7..];
-                        let end = after.find(' ').unwrap_or(after.len());
-                        directory = after[..end].to_string();
-                    }
+            if msg_type == "session.info"
+                && directory.is_empty()
+                && data.get("infoType").and_then(|v| v.as_str()) == Some("folder_trust")
+            {
+                let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                // Extract path from "Folder /path/to/dir has been added..."
+                if let Some(pos) = message.find("Folder /") {
+                    let after = &message[pos + 7..];
+                    let end = after.find(' ').unwrap_or(after.len());
+                    directory = after[..end].to_string();
                 }
             }
 
