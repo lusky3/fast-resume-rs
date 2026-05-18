@@ -6,6 +6,7 @@ import shlex
 import time
 from collections.abc import Callable
 
+from rich.markup import escape as escape_markup
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
@@ -303,26 +304,42 @@ class FastResumeApp(App):
     def _check_for_updates(self) -> None:
         """Check PyPI for newer version and notify if available."""
         import json
+        import urllib.error
         import urllib.request
 
         from .. import __version__
 
+        # Cap the response body so a misbehaving / compromised network path
+        # can't stream an unbounded payload into memory.
+        max_response_bytes = 512 * 1024
         try:
             url = "https://pypi.org/pypi/fast-resume/json"
-            with urllib.request.urlopen(url, timeout=3) as response:
-                data = json.load(response)
-                latest = data["info"]["version"]
+            # `url` is a constant literal above; not user-controlled.
+            with urllib.request.urlopen(url, timeout=3) as response:  # nosemgrep
+                raw = response.read(max_response_bytes + 1)
+            if len(raw) > max_response_bytes:
+                logger.debug("PyPI update check: response exceeded cap; skipping")
+                return
+            data = json.loads(raw)
+            latest = data["info"]["version"]
 
             if latest != __version__:
                 self._available_update = latest
+                # `latest` is from the PyPI response — treat as untrusted
+                # for Rich markup purposes.
+                safe_latest = escape_markup(str(latest))
                 self.call_from_thread(
                     self.notify,
-                    f"{__version__} → {latest}\nRun [bold]uv tool upgrade fast-resume[/bold] to update",
+                    f"{__version__} → {safe_latest}\nRun [bold]uv tool upgrade fast-resume[/bold] to update",
                     title="Update available",
                     timeout=5,
                 )
-        except Exception:
-            pass  # Silently ignore update check failures
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            # Network or response-shape problems are expected; degrade silently.
+            logger.debug("Update check skipped: %s", e)
+        except (KeyError, TypeError) as e:
+            # The PyPI schema could change in a future API revision.
+            logger.debug("Update check: unexpected response shape: %s", e)
 
     # -------------------------------------------------------------------------
     # Search logic
@@ -467,10 +484,13 @@ class FastResumeApp(App):
         cmd_str = shlex.join(resume_cmd)
         full_cmd = f"cd {shlex.quote(directory)} && {cmd_str}"
 
+        # `full_cmd` contains session.directory (untrusted, from disk JSON).
+        # Escape before passing to notify (markup=True by default).
+        safe_full_cmd = escape_markup(full_cmd)
         if copy_to_clipboard(full_cmd):
-            self.notify(f"Copied: {full_cmd}", timeout=3)
+            self.notify(f"Copied: {safe_full_cmd}", timeout=3)
         else:
-            self.notify(full_cmd, title="Clipboard unavailable", timeout=5)
+            self.notify(safe_full_cmd, title="Clipboard unavailable", timeout=5)
 
     def _on_copy_yolo_modal_result(self, result: bool | None) -> None:
         """Handle result from yolo mode modal for copy action."""
@@ -482,10 +502,13 @@ class FastResumeApp(App):
         if not self.selected_session:
             return
 
-        # Crush doesn't support CLI resume - show a toast instead
+        # Crush doesn't support CLI resume - show a toast instead.
+        # Escape the directory; it originates from on-disk JSON metadata and
+        # could otherwise be interpreted as Rich markup by the notification.
         if self.selected_session.agent == "crush":
+            safe_dir = escape_markup(self.selected_session.directory)
             self.notify(
-                f"Crush doesn't support CLI resume. Open crush in: [bold]{self.selected_session.directory}[/bold] and use ctrl+s to find your session",
+                f"Crush doesn't support CLI resume. Open crush in: [bold]{safe_dir}[/bold] and use ctrl+s to find your session",
                 title="Cannot resume",
                 severity="warning",
                 timeout=5,
@@ -629,5 +652,6 @@ class FastResumeApp(App):
         """Get currently displayed sessions (for backward compatibility)."""
         try:
             return self.query_one(ResultsTable).displayed_sessions
-        except Exception:
+        except NoMatches:
+            # Widget tree not mounted yet (or torn down): legitimate empty.
             return []

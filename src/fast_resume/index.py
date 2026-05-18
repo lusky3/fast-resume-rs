@@ -737,11 +737,20 @@ class TantivyIndex:
         exact_query = index.parse_query(query, ["title", "content"])
         boosted_exact = tantivy.Query.boost_query(exact_query, 5.0)
 
+        # Cap the fuzzy expansion. Each kept term creates two prefix-fuzzy
+        # queries which each can expand to many posting-list scans; without
+        # a cap an adversarial query like a long line of one-character tokens
+        # can blow up search latency on a large index.
+        max_fuzzy_terms = 8
+        min_term_len = 2
+
         # Fuzzy match queries for typo tolerance
         fuzzy_parts: list[tuple[tantivy.Occur, tantivy.Query]] = []
         for term in query.split():
-            if not term:
+            if len(term) < min_term_len:
                 continue
+            if len(fuzzy_parts) >= max_fuzzy_terms:
+                break
             # Fuzzy query for title and content
             fuzzy_title = tantivy.Query.fuzzy_term_query(
                 schema, "title", term, distance=1, prefix=True
