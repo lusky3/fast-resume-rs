@@ -1,3 +1,7 @@
+// Items defined in sub-modules but only used in integration tests appear as dead code
+// to the binary. Allow them — they are intentional public API for tests and future callers.
+#![allow(dead_code)]
+
 mod adapters;
 mod config;
 mod index;
@@ -5,6 +9,7 @@ mod query;
 mod search;
 mod session;
 mod tui;
+mod util;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -227,9 +232,19 @@ fn cmd_tui(initial_query: &str, no_images: bool, yolo: bool) {
     };
     match run_tui(opts) {
         Ok(result) => {
-            if let (Some(cmd), Some(_dir)) = (result.resume_command, result.resume_dir) {
+            if let (Some(cmd), Some(dir)) = (result.resume_command, result.resume_dir) {
+                // ratatui::restore() has already been called inside run_tui().
                 println!("Launching: {}", cmd.join(" "));
-                // Phase 7: replace process via execvp.
+
+                // Verify the binary exists on PATH before attempting exec.
+                if let Err(e) = which::which(&cmd[0]) {
+                    eprintln!("error: '{}' not found on PATH: {}", cmd[0], e);
+                    std::process::exit(1);
+                }
+
+                let err = util::proc::replace_process(&cmd, Some(std::path::Path::new(&dir)));
+                eprintln!("error: failed to launch '{}': {}", cmd[0], err);
+                std::process::exit(1);
             }
         }
         Err(e) => {

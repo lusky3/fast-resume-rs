@@ -36,7 +36,16 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = "0.25"
 regex = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
+which = "6"
 
 [profile.release]
+strip = "symbols"
 lto = "thin"
+codegen-units = 1
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+strip = true
+lto = true
 codegen-units = 1
