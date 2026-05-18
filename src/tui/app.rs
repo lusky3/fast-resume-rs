@@ -7,7 +7,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
+                KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+        execute,
+    },
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span},
@@ -68,6 +72,8 @@ pub struct State {
     pub suggestion: Option<String>,
     /// Brief notification message shown in the title bar.
     pub notification: Option<(String, Instant)>,
+    /// Terminal size on the last draw — used to map mouse coordinates to widgets.
+    pub last_term_size: (u16, u16),
     /// Spinner animation frame index.
     spinner_frame: usize,
     /// When the spinner frame was last advanced.
@@ -118,6 +124,7 @@ impl State {
             global_yolo: yolo,
             suggestion,
             notification: None,
+            last_term_size: (0, 0),
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             last_search_at: Instant::now(),
@@ -371,6 +378,8 @@ pub fn run_tui(opts: TuiOpts<'_>) -> Result<TuiResult> {
     });
 
     let mut terminal = ratatui::init();
+    // Enable mouse capture so clicks and scroll events reach the event loop.
+    let _ = execute!(std::io::stderr(), EnableMouseCapture);
     let result = run_app(
         &mut terminal,
         opts.initial_query,
@@ -379,6 +388,8 @@ pub fn run_tui(opts: TuiOpts<'_>) -> Result<TuiResult> {
         search,
         rx,
     );
+    // Disable mouse before restoring the terminal.
+    let _ = execute!(std::io::stderr(), DisableMouseCapture);
     ratatui::restore();
 
     result
@@ -404,6 +415,7 @@ fn run_app(
                 {
                     break;
                 }
+                Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
                 Event::Resize(_, _) | Event::Key(_) => {}
                 _ => {}
             }
@@ -428,6 +440,78 @@ fn run_app(
     };
 
     Ok(result)
+}
+
+/// Handle a mouse event, mapping coordinates to logical TUI regions.
+///
+/// Layout (from `draw`):
+///   row 0        — title bar
+///   rows 1–3     — search box  (height 3, includes borders)
+///   row 4        — filter bar  (height 1)
+///   rows 5..H-2  — main area   (60% results | 40% preview)
+///   row H-1      — footer
+fn handle_mouse(state: &mut State, mouse: MouseEvent) {
+    let (width, height) = state.last_term_size;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let row = mouse.row;
+    let filter_row: u16 = 4;
+    let main_top: u16 = 5;
+    let footer_row = height.saturating_sub(1);
+    let main_height = footer_row.saturating_sub(main_top);
+    let results_cols = (width as f32 * 0.6).round() as u16;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if row == filter_row {
+                // Filter bar click: map column → agent button.
+                let n = (FILTER_AGENTS.len() + 1) as u16; // +1 for "All"
+                let btn_width = (width / n).max(1);
+                let idx = (mouse.column / btn_width) as usize;
+                if idx == 0 {
+                    state.active_agent_filter = None;
+                } else if idx <= FILTER_AGENTS.len() {
+                    let agent = FILTER_AGENTS[idx - 1].to_string();
+                    if state.active_agent_filter.as_deref() == Some(&agent) {
+                        state.active_agent_filter = None; // toggle off
+                    } else {
+                        state.active_agent_filter = Some(agent);
+                    }
+                }
+            } else if row >= main_top
+                && row < main_top + main_height
+                && mouse.column < results_cols
+            {
+                // Results table click: select the clicked row.
+                // The table has a 1-row header — subtract 1.
+                let clicked = (row - main_top).saturating_sub(1) as usize;
+                if clicked < state.results.len() {
+                    state.table_state.select(Some(clicked));
+                    state.preview_scroll = 0;
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if row >= main_top && row < main_top + main_height {
+                if mouse.column < results_cols {
+                    state.select_next();
+                } else {
+                    state.preview_scroll = state.preview_scroll.saturating_add(3);
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if row >= main_top && row < main_top + main_height {
+                if mouse.column < results_cols {
+                    state.select_prev();
+                } else {
+                    state.preview_scroll = state.preview_scroll.saturating_sub(3);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Handle a key press. Returns `true` when the event loop should exit.
@@ -605,6 +689,7 @@ fn build_resume_command(session: &Session) -> Vec<String> {
 /// Top-level draw function.
 pub fn draw(f: &mut Frame, state: &mut State) {
     let area = f.area();
+    state.last_term_size = (area.width, area.height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
