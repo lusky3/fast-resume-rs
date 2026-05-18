@@ -9,6 +9,33 @@
 
 Search and resume conversations across Claude Code, Codex, and more, all from a single place.
 
+## Rust version
+
+A native Rust rewrite of `fast-resume` is in active development on branch `rust/phase-1`.
+All original features are supported — the binary is a drop-in replacement for the Python version.
+
+**Status:** In development on branch `rust/phase-1`. Phases 1–7 complete.
+
+**Build from source:**
+
+```bash
+git checkout rust/phase-1
+cargo build --release
+./target/release/fr
+```
+
+**Supported flags** (all original flags work):
+
+| Flag | Description |
+|------|-------------|
+| `--no-tui` | Print sessions as a table without launching the TUI |
+| `--stats` | Print per-agent session counts and adapter statistics |
+| `--rebuild` | Wipe the Tantivy index and force a full re-index |
+| `--yolo` | Skip the yolo confirmation modal and always pass auto-approve flags |
+| `--no-images` | Force Unicode half-block rendering (for terminals without Sixel/Kitty support) |
+
+**Binary size:** ~12 MB stripped (well under the 30 MB target).
+
 ## Why fast-resume?
 
 Coding agents are really good right now, so I'm using a bunch of them. Sometimes I remember I, or the LLM, mentioned something specific in a previous session, and I want to go back to it.
