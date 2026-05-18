@@ -1,4 +1,6 @@
 pub mod app;
+pub mod filter_bar;
+pub mod icons;
 pub mod input_widget;
 pub mod preview;
 pub mod results_list;
