@@ -11,6 +11,8 @@ from .adapters import (
     CopilotVSCodeAdapter,
     CrushAdapter,
     ErrorCallback,
+    GeminiAdapter,
+    KiroAdapter,
     OpenCodeAdapter,
     Session,
     VibeAdapter,
@@ -32,6 +34,8 @@ class SessionSearch:
             CopilotAdapter(),
             CopilotVSCodeAdapter(),
             CrushAdapter(),
+            GeminiAdapter(),
+            KiroAdapter(),
             OpenCodeAdapter(),
             VibeAdapter(),
         ]
@@ -155,20 +159,34 @@ class SessionSearch:
 
         # Thread-safe batch buffer for progressive indexing
         lock = threading.Lock()
+        # The Tantivy writer is exclusive; serialize commits with their own
+        # lock so adapter callbacks aren't blocked from appending to the
+        # buffer while a flush is in progress.
+        writer_lock = threading.Lock()
         pending_sessions: list[Session] = []
         all_deleted_ids: list[str] = []
         sessions_since_progress = 0
 
         def flush_pending() -> None:
-            """Flush pending sessions to index (must be called with lock held)."""
+            """Flush buffered sessions to Tantivy.
+
+            Snapshot the buffer under `lock` (so callbacks can keep
+            appending), then commit under `writer_lock` (Tantivy's writer
+            is exclusive — concurrent flushes raise LockBusy).
+            """
             nonlocal pending_sessions
-            if pending_sessions:
-                self._index.update_sessions(pending_sessions)
+            with lock:
+                if not pending_sessions:
+                    return
+                batch = pending_sessions
                 pending_sessions = []
+            with writer_lock:
+                self._index.update_sessions(batch)
 
         def handle_session(session: Session) -> None:
             """Buffer session for batched indexing (thread-safe)."""
             nonlocal total_new, total_updated, sessions_since_progress
+            should_flush = False
             with lock:
                 # Add to lookup immediately for search during streaming
                 self._sessions_by_id[session.id] = session
@@ -182,8 +200,10 @@ class SessionSearch:
                 sessions_since_progress += 1
                 if sessions_since_progress >= batch_size:
                     sessions_since_progress = 0
-                    flush_pending()  # Commit before UI update so search sees new sessions
-                    on_progress()
+                    should_flush = True
+            if should_flush:
+                flush_pending()  # Commit before UI update so search sees new sessions
+                on_progress()
 
         def get_incremental(adapter):
             return adapter.find_sessions_incremental(
@@ -198,20 +218,18 @@ class SessionSearch:
                 for future in as_completed(futures):
                     _new_or_modified, deleted_ids = future.result()
 
-                    with lock:
-                        # Flush pending sessions when adapter completes
-                        flush_pending()
+                    # Flush outside the deletion-accumulation critical section.
+                    flush_pending()
 
-                        # Accumulate deletions (will be processed at the end)
-                        if deleted_ids:
+                    if deleted_ids:
+                        with lock:
                             all_deleted_ids.extend(deleted_ids)
                             for sid in deleted_ids:
                                 self._sessions_by_id.pop(sid, None)
                             total_deleted += len(deleted_ids)
         finally:
             # Final flush of any remaining sessions
-            with lock:
-                flush_pending()
+            flush_pending()
             # Process all deletions in a single operation
             if all_deleted_ids:
                 self._index.delete_sessions(all_deleted_ids)
@@ -292,12 +310,15 @@ class SessionSearch:
         return self._index.get_session_count(agent_filter)
 
     def get_agents_with_sessions(self) -> set[str]:
-        """Get the set of agent names that have at least one session."""
-        agents = set()
-        for adapter in self.adapters:
-            if self._index.get_session_count(adapter.name) > 0:
-                agents.add(adapter.name)
-        return agents
+        """Get the set of agent names that have at least one session.
+
+        Uses a single index pass (via the cached `get_known_sessions`
+        traversal) instead of N per-agent count queries — each of those
+        would reopen the Tantivy searcher and round-trip the index.
+        """
+        adapter_names = {adapter.name for adapter in self.adapters}
+        known = self._index.get_known_sessions()
+        return {agent for (_mtime, agent) in known.values() if agent in adapter_names}
 
     def get_adapter_for_session(self, session: Session):
         """Get the adapter for a session."""

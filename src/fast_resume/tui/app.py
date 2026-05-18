@@ -3,9 +3,11 @@
 import logging
 import os
 import shlex
+import shutil
 import time
 from collections.abc import Callable
 
+from rich.markup import escape as escape_markup
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
@@ -92,6 +94,10 @@ class FastResumeApp(App):
         self._search_timer: Timer | None = None
         self._available_update: str | None = None
         self._syncing_filter: bool = False  # Prevent infinite loops during sync
+        # Memo of the last preview we rendered so j/k navigation across the
+        # same session doesn't force a full layout pass on every keypress.
+        self._previewed_session: Session | None = None
+        self._previewed_query: str = ""
 
     def compose(self) -> ComposeResult:
         """Create child widgets."""
@@ -303,26 +309,42 @@ class FastResumeApp(App):
     def _check_for_updates(self) -> None:
         """Check PyPI for newer version and notify if available."""
         import json
+        import urllib.error
         import urllib.request
 
         from .. import __version__
 
+        # Cap the response body so a misbehaving / compromised network path
+        # can't stream an unbounded payload into memory.
+        max_response_bytes = 512 * 1024
         try:
             url = "https://pypi.org/pypi/fast-resume/json"
-            with urllib.request.urlopen(url, timeout=3) as response:
-                data = json.load(response)
-                latest = data["info"]["version"]
+            # `url` is a constant literal above; not user-controlled.
+            with urllib.request.urlopen(url, timeout=3) as response:  # nosemgrep
+                raw = response.read(max_response_bytes + 1)
+            if len(raw) > max_response_bytes:
+                logger.debug("PyPI update check: response exceeded cap; skipping")
+                return
+            data = json.loads(raw)
+            latest = data["info"]["version"]
 
             if latest != __version__:
                 self._available_update = latest
+                # `latest` is from the PyPI response — treat as untrusted
+                # for Rich markup purposes.
+                safe_latest = escape_markup(str(latest))
                 self.call_from_thread(
                     self.notify,
-                    f"{__version__} → {latest}\nRun [bold]uv tool upgrade fast-resume[/bold] to update",
+                    f"{__version__} → {safe_latest}\nRun [bold]uv tool upgrade fast-resume[/bold] to update",
                     title="Update available",
                     timeout=5,
                 )
-        except Exception:
-            pass  # Silently ignore update check failures
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            # Network or response-shape problems are expected; degrade silently.
+            logger.debug("Update check skipped: %s", e)
+        except (KeyError, TypeError) as e:
+            # The PyPI schema could change in a future API revision.
+            logger.debug("Update check: unexpected response shape: %s", e)
 
     # -------------------------------------------------------------------------
     # Search logic
@@ -355,7 +377,44 @@ class FastResumeApp(App):
         except NoMatches:
             return  # Widget not mounted yet
         self.selected_session = table.update_sessions(sessions, self._current_query)
+        # The DataTable's `RowHighlighted` event doesn't fire when the cursor
+        # was already at row 0 before the table was cleared, so the preview
+        # pane would otherwise keep stale content from the previous filter.
+        # Refresh it explicitly here.
+        self._refresh_preview(self.selected_session)
         self._update_session_count()
+
+    def _refresh_preview(self, session: Session | None) -> None:
+        """Sync the preview pane to `session`, resetting scroll and forcing
+        a layout pass so the scrollbar thumb and any inline-image cells from
+        the previous render don't linger.
+
+        Cheap no-op when the preview already shows this session and the
+        search query hasn't changed — protects j/k navigation from doing
+        per-keystroke full repaints.
+        """
+        if (
+            session is not None
+            and session is self._previewed_session
+            and self._current_query == self._previewed_query
+        ):
+            return
+        try:
+            preview = self.query_one(SessionPreview)
+            container = self.query_one("#preview-container")
+        except NoMatches:
+            return
+        preview.update_preview(session, self._current_query)
+        # Reset scroll position so the scrollbar thumb doesn't get stuck as a
+        # stale blue block when switching from a tall preview to a short one.
+        container.scroll_home(animate=False)
+        # Force a layout pass so the VerticalScroll recomputes scrollbar
+        # visibility and so inline-image renderables drawn by the previous
+        # session don't leave artifacts in the terminal cells.
+        container.refresh(layout=True)
+        preview.refresh(layout=True)
+        self._previewed_session = session
+        self._previewed_query = self._current_query
 
     def _update_selected_session(self) -> None:
         """Update the selected session based on cursor position."""
@@ -366,16 +425,14 @@ class FastResumeApp(App):
         session = table.get_selected_session()
         if session:
             self.selected_session = session
-            preview = self.query_one(SessionPreview)
-            preview.update_preview(session, self._current_query)
+            self._refresh_preview(session)
 
     @on(ResultsTable.Selected)
     def on_results_table_selected(self, event: ResultsTable.Selected) -> None:
         """Handle session selection in results table."""
         if event.session:
             self.selected_session = event.session
-            preview = self.query_one(SessionPreview)
-            preview.update_preview(event.session, self._current_query)
+            self._refresh_preview(event.session)
 
     @on(Input.Changed, "#search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
@@ -449,6 +506,11 @@ class FastResumeApp(App):
 
     def action_copy_path(self) -> None:
         """Copy the full resume command (cd + agent resume) to clipboard."""
+        # Textual checks App-level priority bindings even while a modal is
+        # active. Without this guard, pressing `c` during the yolo modal
+        # would stack a second YoloModeModal on top of the first.
+        if isinstance(self.screen, YoloModeModal):
+            return
         if not self.selected_session:
             return
         self._resolve_yolo_mode(self._do_copy_command, self._on_copy_yolo_modal_result)
@@ -467,10 +529,13 @@ class FastResumeApp(App):
         cmd_str = shlex.join(resume_cmd)
         full_cmd = f"cd {shlex.quote(directory)} && {cmd_str}"
 
+        # `full_cmd` contains session.directory (untrusted, from disk JSON).
+        # Escape before passing to notify (markup=True by default).
+        safe_full_cmd = escape_markup(full_cmd)
         if copy_to_clipboard(full_cmd):
-            self.notify(f"Copied: {full_cmd}", timeout=3)
+            self.notify(f"Copied: {safe_full_cmd}", timeout=3)
         else:
-            self.notify(full_cmd, title="Clipboard unavailable", timeout=5)
+            self.notify(safe_full_cmd, title="Clipboard unavailable", timeout=5)
 
     def _on_copy_yolo_modal_result(self, result: bool | None) -> None:
         """Handle result from yolo mode modal for copy action."""
@@ -482,10 +547,13 @@ class FastResumeApp(App):
         if not self.selected_session:
             return
 
-        # Crush doesn't support CLI resume - show a toast instead
+        # Crush doesn't support CLI resume - show a toast instead.
+        # Escape the directory; it originates from on-disk JSON metadata and
+        # could otherwise be interpreted as Rich markup by the notification.
         if self.selected_session.agent == "crush":
+            safe_dir = escape_markup(self.selected_session.directory)
             self.notify(
-                f"Crush doesn't support CLI resume. Open crush in: [bold]{self.selected_session.directory}[/bold] and use ctrl+s to find your session",
+                f"Crush doesn't support CLI resume. Open crush in: [bold]{safe_dir}[/bold] and use ctrl+s to find your session",
                 title="Cannot resume",
                 severity="warning",
                 timeout=5,
@@ -497,9 +565,23 @@ class FastResumeApp(App):
     def _do_resume(self, yolo: bool) -> None:
         """Execute the resume with specified yolo mode."""
         assert self.selected_session is not None
-        self._resume_command = self.search_engine.get_resume_command(
+        resume_cmd = self.search_engine.get_resume_command(
             self.selected_session, yolo=yolo
         )
+        if resume_cmd and shutil.which(resume_cmd[0]) is None:
+            # Defensive escape: today both values are hardcoded adapter
+            # constants, but a future adapter setting an exotic binary name
+            # or `name` field shouldn't be able to inject markup.
+            safe_bin = escape_markup(resume_cmd[0])
+            safe_agent = escape_markup(self.selected_session.agent)
+            self.notify(
+                f"Couldn't find '{safe_bin}' on your PATH. "
+                f"Is the {safe_agent} CLI installed?",
+                severity="error",
+                timeout=8,
+            )
+            return
+        self._resume_command = resume_cmd
         self._resume_directory = self.selected_session.directory
         self.exit()
 
@@ -514,10 +596,18 @@ class FastResumeApp(App):
 
     def action_focus_search(self) -> None:
         """Focus the search input."""
+        # Don't yank focus away from the modal's buttons; the modal owns
+        # the screen and `/` should be a no-op while it's up.
+        if isinstance(self.screen, YoloModeModal):
+            return
         self.query_one("#search-input", Input).focus()
 
     def action_toggle_preview(self) -> None:
         """Toggle the preview pane."""
+        # The preview lives on the main screen; toggling it while the modal
+        # is up would change behind-the-modal state invisibly.
+        if isinstance(self.screen, YoloModeModal):
+            return
         self.show_preview = not self.show_preview
         preview_container = self.query_one("#preview-container")
         if self.show_preview:
@@ -585,29 +675,24 @@ class FastResumeApp(App):
 
     def action_accept_suggestion(self) -> None:
         """Accept autocomplete suggestion in search input."""
-        # If a modal is open, let it handle tab for focus switching
+        # When the launch modal is open, Tab uses Textual's default focus
+        # cycling (yolo checkbox → Cancel → Launch), so this binding only
+        # applies to the main search screen.
         if isinstance(self.screen, YoloModeModal):
-            self.screen.action_toggle_focus()
             return
         search_input = self.query_one("#search-input", Input)
         if search_input._suggestion:
             search_input.action_cursor_right()
-
-    def action_cycle_filter(self) -> None:
-        """Cycle to the next agent filter."""
-        try:
-            current_index = FILTER_KEYS.index(self.active_filter)
-            next_index = (current_index + 1) % len(FILTER_KEYS)
-        except ValueError:
-            next_index = 0
-        self._set_filter(FILTER_KEYS[next_index])
 
     async def action_quit(self) -> None:
         """Quit the app, or dismiss modal if one is open."""
         if len(self.screen_stack) > 1:
             top_screen = self.screen_stack[-1]
             if isinstance(top_screen, YoloModeModal):
-                top_screen.dismiss(None)
+                # Route through the modal's own cancel action so any future
+                # cancellation logic (state checks, telemetry, etc.) stays in
+                # one place rather than being silently bypassed here.
+                top_screen.action_cancel()
             return
         self.exit()
 
@@ -624,10 +709,27 @@ class FastResumeApp(App):
         """Get the directory to change to before running the resume command."""
         return self._resume_directory
 
+    # -------------------------------------------------------------------------
+    # Rendering / repaint hooks
+    # -------------------------------------------------------------------------
+
+    def _unnotify(self, notification: object, refresh: bool = True) -> None:
+        """Override to force a full screen repaint when a toast is dismissed.
+
+        The toast widget is removed from the DOM but the terminal cells it
+        occupied are not always cleared by Textual's normal damage tracking
+        (depends on the backend/protocol).  Scheduling a repaint here ensures
+        no ghost rows are left on screen.
+        """
+        super()._unnotify(notification, refresh)  # type: ignore[arg-type]
+        # Schedule the repaint so it runs after the widget removal is processed
+        self.call_later(self.screen.refresh, repaint=True)
+
     @property
     def _displayed_sessions(self) -> list[Session]:
         """Get currently displayed sessions (for backward compatibility)."""
         try:
             return self.query_one(ResultsTable).displayed_sessions
-        except Exception:
+        except NoMatches:
+            # Widget tree not mounted yet (or torn down): legitimate empty.
             return []

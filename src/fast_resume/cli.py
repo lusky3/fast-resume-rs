@@ -1,11 +1,15 @@
 """CLI entry point for fast-resume."""
 
 import os
+import shlex
+import sys
 
 import click
 import humanize
 from rich.console import Console
+from rich.markup import escape as escape_markup
 from rich.table import Table
+from rich.text import Text
 
 from .config import AGENTS, INDEX_DIR
 from .index import TantivyIndex
@@ -26,6 +30,8 @@ from .tui import run_tui
             "copilot-cli",
             "copilot-vscode",
             "crush",
+            "gemini",
+            "kiro",
             "opencode",
             "vibe",
         ]
@@ -119,8 +125,23 @@ def main(
             # Change to session directory before running command
             if resume_dir:
                 os.chdir(resume_dir)
+            # Print a brief launch banner so the gap between the TUI tearing
+            # down and the agent CLI drawing its own screen isn't silent.
+            # Escape the joined command: session ids come from JSON on disk
+            # and could otherwise be parsed as Rich markup.
+            console = Console()
+            console.print(
+                f"[dim]Launching:[/dim] [bold]{escape_markup(shlex.join(resume_cmd))}[/bold]"
+            )
             # Execute the resume command
-            os.execvp(resume_cmd[0], resume_cmd)
+            try:
+                os.execvp(resume_cmd[0], resume_cmd)
+            except OSError as e:
+                console.print(
+                    f"[bold red]Error:[/bold red] couldn't execute "
+                    f"'{escape_markup(resume_cmd[0])}': {escape_markup(str(e))}"
+                )
+                sys.exit(1)
 
 
 def _show_stats() -> None:
@@ -195,8 +216,11 @@ def _show_stats() -> None:
             if data_dir.startswith(home):
                 data_dir = "~" + data_dir[len(home) :]
 
+            # `data_dir` can be user-controlled (e.g. Crush reads it from
+            # `~/.local/share/crush/projects.json`); wrap in Text to avoid
+            # markup parsing. `agent_name` is hardcoded but kept consistent.
             agent_table.add_row(
-                f"[{color}]{agent_name}[/{color}]",
+                Text(agent_name, style=color),
                 str(raw_stats.file_count),
                 humanize.naturalsize(raw_stats.total_bytes),
                 str(sessions) if sessions > 0 else "[dim]0[/dim]",
@@ -204,11 +228,11 @@ def _show_stats() -> None:
                 humanize.naturalsize(content_size)
                 if content_size > 0
                 else "[dim]-[/dim]",
-                f"[dim]{data_dir}[/dim]",
+                Text(data_dir, style="dim"),
             )
         else:
             agent_table.add_row(
-                f"[{color}]{agent_name}[/{color}]",
+                Text(agent_name, style=color),
                 "[dim]-[/dim]",
                 "[dim]-[/dim]",
                 "[dim]-[/dim]",
@@ -273,7 +297,9 @@ def _show_stats() -> None:
             display_dir = directory
             if display_dir.startswith(home):
                 display_dir = "~" + display_dir[len(home) :]
-            dir_table.add_row(display_dir, str(sessions), f"{messages:,}")
+            # `display_dir` comes from session metadata on disk — wrap in
+            # Text so Rich doesn't interpret embedded markup.
+            dir_table.add_row(Text(display_dir), str(sessions), f"{messages:,}")
 
         console.print(dir_table)
 
@@ -310,11 +336,13 @@ def _list_sessions(query: str, agent: str | None, directory: str | None) -> None
         if len(directory_display) > 35:
             directory_display = "..." + directory_display[-32:]
 
+        # Wrap untrusted strings in Text() so Rich doesn't interpret embedded
+        # markup. Session title/directory/id originate from JSON on disk.
         table.add_row(
-            f"[{agent_style}]{session.agent}[/{agent_style}]",
-            title,
-            directory_display,
-            session.id,
+            Text(session.agent, style=agent_style),
+            Text(title),
+            Text(directory_display),
+            Text(session.id),
         )
 
     console.print(table)

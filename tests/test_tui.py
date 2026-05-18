@@ -499,6 +499,24 @@ def mock_search_engine(sample_sessions):
     return mock
 
 
+@pytest.fixture(autouse=True)
+def mock_shutil_which_for_tui(request):
+    """Patch shutil.which in app.py so resume commands appear findable by default.
+
+    Tests that specifically want to test the "binary not found" path opt out by
+    including 'path_validation' in their marker or by using their own patch.
+    """
+    # The TestPathValidation tests manage their own shutil.which patch
+    if (
+        request.node.cls is not None
+        and request.node.cls.__name__ == "TestPathValidation"
+    ):
+        yield
+        return
+    with patch("fast_resume.tui.app.shutil.which", return_value="/usr/bin/fake-agent"):
+        yield
+
+
 class TestFastResumeAppBasic:
     """Basic TUI integration tests."""
 
@@ -1080,8 +1098,9 @@ class TestFastResumeAppYoloModal:
                 # App should still be running (modal is shown)
                 assert app.is_running
 
-                # Press 'n' to select normal mode
-                await pilot.press("n")
+                # Default switch state is off; pressing Enter on the launch
+                # button dismisses the modal and exits the TUI without yolo.
+                await pilot.press("enter")
                 await pilot.pause()
 
                 # Now app should have exited
@@ -1174,8 +1193,10 @@ class TestFastResumeAppYoloModal:
                 await pilot.press("enter")
                 await pilot.pause()
 
-                # Press 'y' to select yolo mode
+                # Press 'y' to turn the yolo checkbox on, then Enter to launch
                 await pilot.press("y")
+                await pilot.pause()
+                await pilot.press("enter")
                 await pilot.pause()
 
                 # App should have exited
@@ -1187,8 +1208,8 @@ class TestFastResumeAppYoloModal:
                 assert "--dangerously-skip-permissions" in cmd
 
     @pytest.mark.asyncio
-    async def test_tab_toggles_focus_in_modal(self, sample_sessions):
-        """Test that tab key toggles focus between buttons in yolo modal."""
+    async def test_modal_arrow_keys_move_focus(self, sample_sessions):
+        """Left/Right arrow keys move focus between Cancel and Launch."""
         mock = MagicMock()
         mock.search.return_value = sample_sessions
         mock.get_session_count.return_value = len(sample_sessions)
@@ -1210,23 +1231,55 @@ class TestFastResumeAppYoloModal:
                 await pilot.press("enter")
                 await pilot.pause()
 
-                # Initial focus should be on normal-btn
+                # Initial focus should be on launch-btn (so Enter launches).
                 modal = app.screen
-                assert modal.focused.id == "normal-btn"
+                assert modal.focused is not None
+                assert modal.focused.id == "launch-btn"
 
-                # Press tab to toggle focus to yolo-btn
-                await pilot.press("tab")
+                # Left arrow moves focus to cancel-btn
+                await pilot.press("left")
                 await pilot.pause()
-                assert modal.focused.id == "yolo-btn"
+                assert modal.focused.id == "cancel-btn"
 
-                # Press tab again to toggle back to normal-btn
-                await pilot.press("tab")
+                # Right arrow moves focus back to launch-btn
+                await pilot.press("right")
                 await pilot.pause()
-                assert modal.focused.id == "normal-btn"
+                assert modal.focused.id == "launch-btn"
 
-                # Dismiss modal
+                # Escape cancels (returns None, no resume)
                 await pilot.press("escape")
                 await pilot.pause()
+                assert app.get_resume_command() is None
+
+    @pytest.mark.asyncio
+    async def test_modal_cancel_keeps_tui_open(self, sample_sessions):
+        """Pressing Escape on the modal cancels without exiting the TUI."""
+        mock = MagicMock()
+        mock.search.return_value = sample_sessions
+        mock.get_session_count.return_value = len(sample_sessions)
+        mock._load_from_index.return_value = sample_sessions
+        mock._sessions = sample_sessions
+        mock._streaming_in_progress = False
+        mock.get_sessions_streaming.return_value = (sample_sessions, 0, 0, 0)
+        mock.get_resume_command.return_value = ["claude", "--resume", "session-1"]
+        mock_adapter = MagicMock()
+        mock_adapter.supports_yolo = True
+        mock.get_adapter_for_session.return_value = mock_adapter
+
+        with patch("fast_resume.tui.app.SessionSearch", return_value=mock):
+            app = FastResumeApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+
+                await pilot.press("enter")  # show modal
+                await pilot.pause()
+                await pilot.press("escape")  # cancel modal
+                await pilot.pause()
+
+                # The modal closes (FastResumeApp's `escape` binding then
+                # exits the app once the modal stack is empty), but no resume
+                # command should have been set.
+                assert app.get_resume_command() is None
 
 
 class TestFastResumeAppRunTui:
@@ -1353,3 +1406,95 @@ class TestKeywordSuggester:
         """Test that suggestions are case insensitive."""
         result = await suggester.get_suggestion("agent:CL")
         assert result == "agent:claude"
+
+
+class TestPathValidation:
+    """Tests for PATH validation before launching agent CLI."""
+
+    @pytest.mark.asyncio
+    async def test_missing_binary_shows_notification_and_keeps_app_running(
+        self, mock_search_engine
+    ):
+        """When the agent binary is not on PATH, show an error notification and
+        do not exit the TUI."""
+        with patch(
+            "fast_resume.tui.app.SessionSearch", return_value=mock_search_engine
+        ):
+            with patch("fast_resume.tui.app.shutil.which", return_value=None):
+                app = FastResumeApp()
+                async with app.run_test(size=(120, 40)) as pilot:
+                    await pilot.pause()
+
+                    # Press Enter to trigger resume attempt
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                    # App should still be running (binary not found)
+                    assert app.is_running
+
+                    # _resume_command must not have been set
+                    assert app.get_resume_command() is None
+
+                    # Quit cleanly so run_test context exits without error
+                    await pilot.press("escape")
+
+    @pytest.mark.asyncio
+    async def test_missing_binary_notification_message(self, mock_search_engine):
+        """When the agent binary is missing the notification references the binary
+        name and the agent name."""
+        notifications_posted: list = []
+
+        with patch(
+            "fast_resume.tui.app.SessionSearch", return_value=mock_search_engine
+        ):
+            with patch("fast_resume.tui.app.shutil.which", return_value=None):
+                app = FastResumeApp()
+                async with app.run_test(size=(120, 40)) as pilot:
+                    await pilot.pause()
+
+                    # Capture notifications via the app's notify method
+                    original_notify = app.notify
+
+                    def capturing_notify(*args, **kwargs):
+                        notifications_posted.append((args, kwargs))
+                        return original_notify(*args, **kwargs)
+
+                    app.notify = capturing_notify  # type: ignore[method-assign]
+
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                    # Should have shown an error notification
+                    assert len(notifications_posted) >= 1
+                    notif_text = notifications_posted[0][0][0]
+                    # The notification should mention the binary (claude) and severity=error
+                    assert "claude" in notif_text
+                    assert notifications_posted[0][1].get("severity") == "error"
+
+                    await pilot.press("escape")
+
+    @pytest.mark.asyncio
+    async def test_binary_found_exits_normally(self, mock_search_engine):
+        """When the agent binary is on PATH, the TUI exits and sets _resume_command."""
+        with patch(
+            "fast_resume.tui.app.SessionSearch", return_value=mock_search_engine
+        ):
+            # which returns a real path — binary is found
+            with patch(
+                "fast_resume.tui.app.shutil.which",
+                return_value="/usr/bin/claude",
+            ):
+                app = FastResumeApp()
+                async with app.run_test(size=(120, 40)) as pilot:
+                    await pilot.pause()
+
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                    # App should have exited
+                    assert not app.is_running
+                    assert app.get_resume_command() == [
+                        "claude",
+                        "--resume",
+                        "session-1",
+                    ]
