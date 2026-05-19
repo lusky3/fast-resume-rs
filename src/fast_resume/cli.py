@@ -55,7 +55,7 @@ from .tui import run_tui
     is_flag=True,
     help="Disable checking for new versions",
 )
-@click.version_option()
+@click.version_option(package_name="fast-resume-plus")
 def main(
     query: str,
     agent: str | None,

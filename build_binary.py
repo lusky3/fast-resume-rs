@@ -44,9 +44,9 @@ def get_version() -> str:
 def build() -> None:
     version = get_version()
     platform_tag = get_platform_tag()
-    archive_name = f"fast-resume-{version}-{platform_tag}"
+    archive_name = f"fast-resume-plus-{version}-{platform_tag}"
 
-    print(f"Building fast-resume {version} for {platform_tag}")
+    print(f"Building fast-resume-plus {version} for {platform_tag}")
 
     # Clean previous builds
     build_dir = ROOT / "build"
@@ -76,7 +76,7 @@ def build() -> None:
         "--clean",
         # Copy package metadata so importlib.metadata.version() works
         "--copy-metadata",
-        "fast-resume",
+        "fast-resume-plus",
         # Rich dynamically imports unicode data modules by version string
         "--collect-submodules",
         "rich._unicode_data",

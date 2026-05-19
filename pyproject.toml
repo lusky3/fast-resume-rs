@@ -1,7 +1,7 @@
 [project]
-name = "fast-resume"
+name = "fast-resume-plus"
 version = "1.17.2"
-description = "Fuzzy finder for coding agent session history"
+description = "Fuzzy finder for coding agent session history (fast-resume fork with Kiro, Gemini, and TUI improvements)"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 fr = "fast_resume.cli:main"
 fast-resume = "fast_resume.cli:main"
+fast-resume-plus = "fast_resume.cli:main"
 
 [build-system]
 requires = ["hatchling"]

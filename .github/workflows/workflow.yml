@@ -147,4 +147,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_VERSION: ${{ needs.release.outputs.new_release_version }}
-        run: gh release upload "v${RELEASE_VERSION}" dist/fast-resume-*.tar.gz --clobber
+        run: gh release upload "v${RELEASE_VERSION}" dist/fast-resume-plus-*.tar.gz --clobber

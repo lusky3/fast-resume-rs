@@ -2,4 +2,4 @@
 
 from importlib.metadata import version
 
-__version__ = version("fast-resume")
+__version__ = version("fast-resume-plus")

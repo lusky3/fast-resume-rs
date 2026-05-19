@@ -134,7 +134,7 @@ wheels = [
 ]
 
 [[package]]
-name = "fast-resume"
+name = "fast-resume-plus"
 version = "1.17.2"
 source = { editable = "." }
 dependencies = [

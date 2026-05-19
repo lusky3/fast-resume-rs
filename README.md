@@ -47,10 +47,10 @@ brew install fast-resume
 
 ```bash
 # Run directly (no install needed)
-uvx --from fast-resume fr
+uvx --from fast-resume-plus fr
 
 # Or install permanently
-uv tool install fast-resume
+uv tool install fast-resume-plus
 fr
 ```
 

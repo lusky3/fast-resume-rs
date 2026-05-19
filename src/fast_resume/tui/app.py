@@ -36,7 +36,7 @@ class FastResumeApp(App):
     """Main TUI application for fast-resume."""
 
     ENABLE_COMMAND_PALETTE = True
-    TITLE = "fast-resume"
+    TITLE = "fast-resume+"
     SUB_TITLE = "Session manager"
 
     CSS = APP_CSS
