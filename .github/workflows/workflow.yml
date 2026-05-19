@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 permissions:
   contents: write
@@ -16,10 +16,10 @@ jobs:
     name: Commit Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: lts/*
       - run: npm install -D @commitlint/cli @commitlint/config-conventional
@@ -28,47 +28,41 @@ jobs:
         run: npx commitlint --last --verbose
       - name: Validate PR commits with commitlint
         if: github.event_name == 'pull_request'
-        run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: npx commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
+      - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
+        uses: astral-sh/setup-uv@v5
       - name: Install dependencies
         run: uv sync
-
       - name: Run tests
         run: uv run pytest -v
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
+      - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
+        uses: astral-sh/setup-uv@v5
       - name: Run ruff check
         run: uvx ruff check src/ tests/
-
       - name: Run ruff format check
         run: uvx ruff format --check src/ tests/
 
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
+      - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
+        uses: astral-sh/setup-uv@v5
       - name: Install dependencies
         run: uv sync
-
       - name: Run ty type check
         run: uvx ty check src/
 
@@ -76,8 +70,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     needs: [commitlint, test, lint, typecheck]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    # Prevent concurrent releases from racing (would cause "tag already exists" errors)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     concurrency:
       group: release
       cancel-in-progress: false
@@ -89,15 +82,15 @@ jobs:
     outputs:
       new_release_version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: lts/*
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v5
       - name: Get latest tag before release
         id: before
         run: echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
@@ -106,13 +99,17 @@ jobs:
       - name: Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set UV_PUBLISH_TOKEN in repo secrets to enable PyPI publishing.
+          # Leave unset to skip (GitHub Release + binaries still work without it).
+          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: npx semantic-release
       - name: Check if a new release was created
         id: check
         run: |
           git fetch --tags
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo '')
-          if [ "$LATEST_TAG" != "${{ steps.before.outputs.tag }}" ] && [ -n "$LATEST_TAG" ]; then
+          BEFORE_TAG="${{ steps.before.outputs.tag }}"
+          if [ "$LATEST_TAG" != "$BEFORE_TAG" ] && [ -n "$LATEST_TAG" ]; then
             echo "version=${LATEST_TAG#v}" >> "$GITHUB_OUTPUT"
           fi
 
@@ -132,46 +129,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           ref: v${{ needs.release.outputs.new_release_version }}
-
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
+        uses: astral-sh/setup-uv@v5
       - name: Install dependencies
         run: uv sync
-
       - name: Install PyInstaller
         run: uv pip install pyinstaller
-
       - name: Build binary
         run: uv run python build_binary.py
-
       - name: Verify binary runs
         run: |
           ./dist/fr/fr --version
           ./dist/fr/fr --help
-
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "v${{ needs.release.outputs.new_release_version }}" \
-            dist/fast-resume-*.tar.gz \
-            --clobber
-
-  update-homebrew:
-    name: Update Homebrew formula
-    needs: [release, build-binaries]
-    if: needs.release.outputs.new_release_version != ''
-    runs-on: ubuntu-latest
-    steps:
-      - name: Notify homebrew-tap
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          gh api repos/angristan/homebrew-tap/dispatches \
-            -f event_type=update-formula \
-            -f "client_payload[formula]=fast-resume" \
-            -f "client_payload[version]=${{ needs.release.outputs.new_release_version }}"
+          RELEASE_VERSION: ${{ needs.release.outputs.new_release_version }}
+        run: gh release upload "v${RELEASE_VERSION}" dist/fast-resume-*.tar.gz --clobber

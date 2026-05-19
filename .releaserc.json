@@ -1,5 +1,5 @@
 {
-  "branches": ["master"],
+  "branches": ["main"],
   "plugins": [
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
@@ -13,7 +13,7 @@
       "@semantic-release/exec",
       {
         "prepareCmd": "sed -i 's/^version = .*/version = \"${nextRelease.version}\"/' pyproject.toml && uv lock",
-        "publishCmd": "uv build && uv publish"
+        "publishCmd": "uv build && ([ -z \"$UV_PUBLISH_TOKEN\" ] && echo 'UV_PUBLISH_TOKEN not set — skipping PyPI publish' || uv publish)"
       }
     ],
     [
